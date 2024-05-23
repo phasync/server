@@ -1,0 +1,21 @@
+{
+    "name": "phasync/server",
+    "description": "A high performance async TCP and UDP socket server for PHP.",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "phasync\\Server\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Frode Børli",
+            "email": "frode@ennerd.com"
+        }
+    ],
+    "minimum-stability": "dev",
+    "require": {
+        "phasync/phasync": "^0"
+    }
+}
