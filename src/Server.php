@@ -49,6 +49,7 @@ final class Server {
 
     public const PROTO_TCP = 'tcp';
     public const PROTO_UDP = 'udp';
+    public const PROTO_UNIX = 'unix';
 
     /**
      * The socket resource
@@ -72,25 +73,26 @@ final class Server {
     private string $host;
 
     /**
-     * The host specified in the host part of the address.
+     * The actual port number used by the socket server. For unix
+     * sockets this will be null.
+     * 
+     * @var int|null
+     */
+    private ?int $port;
+
+    /**
+     * The address used when creating the server instance.
      * 
      * @var string
      */
-    private string $requestedHost;
+    private string $address;
 
     /**
-     * The actual port number used by the socket server.
+     * The flags used when creating the server instance.
      * 
      * @var int
      */
-    private int $port;
-
-    /**
-     * The requested port number in the port part of the address.
-     * 
-     * @var string
-     */
-    private string $requestedPort;
+    private int $flags;
 
     /**
      * This class constructor generally accepts the same arguments as \stream_socket_server()
@@ -105,18 +107,23 @@ final class Server {
      * @return void 
      */
     public function __construct(string $address, int $flags = STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context = null) {                
+        $this->address = $address;
+        $this->flags = $flags;
+
         $url = parse_url($address);
-        if (!is_array($url) || empty($url['scheme']) || empty($url['port']) || empty($url['host'])) {
-            throw new LogicException("The address is in an incorrect format. Valid example: 'tcp://0.0.0.0:8080' or 'udp://0.0.0.0:8080'.");
+        if (
+            !is_array($url) || empty($url['scheme']) || 
+            ($url['scheme'] !== 'unix' && (empty($url['port']) || empty($url['host'])))
+        ) {
+            throw new LogicException("The address is in an incorrect format. Valid example: 'tcp://0.0.0.0:8080', 'udp://0.0.0.0:8080', 'unix:///path/to/unix.sock'.");
         }
         switch ($url['scheme']) {
+            case self::PROTO_UNIX:
             case self::PROTO_TCP:
             case self::PROTO_UDP: break;
-            default: throw new LogicException("Scheme " . $url['scheme'] . " not supported. Use 'udp://' or 'tcp://'.");
+            default: throw new LogicException("Scheme " . $url['scheme'] . " not supported. Use 'unix://', 'udp://' or 'tcp://'.");
         }
         $this->scheme = $url['scheme'];
-        $this->requestedHost = $url['host'];
-        $this->requestedPort = (int) ($url['port'] ?: 0);
 
         if ($context === null) {
             $context = [];
@@ -124,12 +131,23 @@ final class Server {
             $context = stream_context_get_options($context);
         }
 
-        if (empty($context['socket'])) {
-            $context['socket'] = [
-                'backlog' => 511,       // Allow PHP to hold a number of sockets while doing other stuff
-                'so_reuseport' => true, // See README.md
-                'tcp_nodelay' => true,  // See README.md
-            ];
+        if (empty($context['socket']['backlog'])) {
+            // This setting allows the socket to hold up to 511 pending
+            // connections.
+            $context['socket']['backlog'] = 511;
+        }
+        if (empty($context['socket']['so_reuseport'])) {
+            // This settings allows other processes of the same user to
+            // also accept connections on this socket.
+            $context['socket']['so_reuseport'] = true;
+        }
+        if (empty($context['socket']['tcp_nodelay'])) {
+            // This setting disables Nagle's algorithm, which is generally
+            // a socket level buffer which prevent sending of small packets
+            // immediately. This is disabled by default since we assume that
+            // by sending a small packet, the developer intends it to be
+            // delivered with minimal latency.
+            $context['socket']['tcp_nodelay'] = true;
         }
 
         $context = \stream_context_create($context);
@@ -138,24 +156,32 @@ final class Server {
         if (!$socket) {
             throw new IOException($error_message, $error_code);
         }
+        \stream_set_blocking($socket, false);
+
+        if ($this->scheme !== 'unix') {
+            $name = \stream_socket_get_name($socket, false);
+            [$this->host, $this->port] = \explode(":", $name);
+        } else {
+            $this->host = '';
+            $this->port = null;
+        }
 
         $this->socket = $socket;
+    }
 
-        \stream_set_blocking($this->socket, false);
-        $name = \stream_socket_get_name($this->socket, false);
-        [$this->host, $this->port] = \explode(":", $name);
+    public function getFlags(): int {
+        return $this->flags;
     }
 
     /**
-     * Get the address the socket is connected to. This may be different that the
-     * address used to create the server instance, particularly if port 0 was specified.
+     * Get the address the socket is was connected to.
      * 
      * Example: 'tcp://123.123.123.123:48273'.
      * 
      * @return string 
      */
     public function getAddress(): string {
-        return $this->scheme . '://' . $this->requestedHost . ':' . $this->port;
+        return $this->address;
     }
 
     /**
@@ -179,7 +205,7 @@ final class Server {
     /**
      * Get the protocol used by this server
      * 
-     * @return self::TCP|self::UDP
+     * @return self::PROTO_TCP|self::PROTO_UDP|self:PROTO_UNIX
      */
     public function getProtocol(): string {
         return $this->scheme;

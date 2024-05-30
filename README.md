@@ -17,7 +17,7 @@ Server::serve('tcp://127.0.0.1:8080', function($stream, $peer) {
         "Connection: close\r\n".
         "Content-Length: 13\r\n".
         "\r\n".
-        "Hello, world!"
+        "Hello, $peer!"
     );
     fclose($stream);
 });
@@ -72,7 +72,7 @@ Server::serve('udp://127.0.0.1:9000', function(Server $server) {
 ## Disabled read and write buffering and large chunk size
 
 Instead of having PHP manage buffering of reads and writes, developers should try to
-read and write big chunks of data. Don't try to read 10 bytes, read 65536 bytes at
+read and write big chunks of data. Don´t try to read 10 bytes, read 65536 bytes at
 a time and do the buffering yourself if needed.
 
 When you read big chunks, the benefit of buffering is gone and the end result is
