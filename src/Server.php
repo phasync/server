@@ -4,7 +4,6 @@ namespace phasync\Server;
 use Closure;
 use Fiber;
 use FiberError;
-use InvalidArgumentException;
 use LogicException;
 use phasync;
 use phasync\CancelledException;
@@ -13,46 +12,18 @@ use Throwable;
 
 /**
  * A simple TCP/UDP server implementation allowing you to serve multiple
- * ports on the same time.
+ * ports at the same time.
  * 
  * @package phasync\Server
  */
 final class Server {
-
-    /**
-     * Create a stream socket server running in a coroutine. To close the server, use
-     * {@see phasync::cancel($server)} or throw phasync\CancelledException from the handler.
-     * 
-     * @param string $address 
-     * @param Closure<resource|Server,?string,void> $handler Closure will be invoked with the client stream if TCP, or the Server instance if UDP.
-     * @return Fiber 
-     * @throws FiberError 
-     * @throws Throwable 
-     */
-    public static function serve(string $address, Closure $handler): Fiber {
-        return phasync::run(args: [$address, $handler], fn: static function(string $address, $handler) {
-            $server = new self($address);
-            if ($server->getProtocol() === self::PROTO_TCP) {
-                do {
-                    try {
-                        $socket = $server->accept($peer);
-                        phasync::go(args: [$socket, $peer], fn: $handler);
-                    } catch (CancelledException $e) {
-                        return;
-                    }
-                } while (true);
-            } else {
-                return $handler($server, null);
-            }
-        });
-    }
 
     public const PROTO_TCP = 'tcp';
     public const PROTO_UDP = 'udp';
     public const PROTO_UNIX = 'unix';
 
     /**
-     * The socket resource
+     * The socket resource.
      * 
      * @var resource
      */
@@ -73,7 +44,7 @@ final class Server {
     private string $host;
 
     /**
-     * The actual port number used by the socket server. For unix
+     * The actual port number used by the socket server. For UNIX
      * sockets this will be null.
      * 
      * @var int|null
@@ -95,20 +66,65 @@ final class Server {
     private int $flags;
 
     /**
-     * This class constructor generally accepts the same arguments as \stream_socket_server()
-     * in the PHP standard library.
+     * The timeout for socket operations.
      * 
-     * @see https://www.php.net/manual/en/function.stream-socket-server.php
-     * @param string $address 
-     * @param int $errorCode 
-     * @param string|null $errorMessage 
-     * @param int $flags 
-     * @param array|resource|null $context 
+     * @var float
+     */
+    private float $timeout;
+
+    /**
+     * Create a stream socket server running in a coroutine. To close the server, use
+     * {@see phasync::cancel($server)} or throw phasync\CancelledException from the handler.
+     * 
+     * Note that for TCP or UNIX socket servers, to handle many connections concurrently
+     * the handler function must launch a coroutine.
+     * 
+     * @param string $address The address to bind the server to.
+     * @param Closure<resource|Server,?string,void> $handler Closure will be invoked with the client stream if TCP, or the Server instance if UDP.
+     * @param float|null $timeout Optional timeout for socket operations.
+     * @return Fiber 
+     * @throws FiberError 
+     * @throws Throwable 
+     */
+    public static function serve(string $address, Closure $handler, ?float $timeout = null): Fiber {
+        $fiber = phasync::go(args: [$address, $handler, $timeout], fn: static function(string $address, $handler, $timeout) {
+            $server = new self($address, timeout: $timeout);
+            $protocol = $server->getProtocol();
+            try {
+                if ($protocol === self::PROTO_TCP || $protocol === self::PROTO_UNIX) {
+                    while (!$server->isClosed()) {
+                        try {
+                            $socket = $server->accept($peer);
+                            $handler($socket, $peer);
+                        } catch (CancelledException) {
+                            return;
+                        }
+                    }
+                } elseif ($protocol === self::PROTO_UDP) {
+                    return $handler($server, null);
+                }    
+            } finally {
+                $server->close();
+            }
+        });
+        if ($fiber->isTerminated()) {
+            phasync::await($fiber);
+        }
+        return $fiber;
+    }
+
+    /**
+     * Constructor to initialize the server with the given address and options.
+     * 
+     * @param string $address The address to bind the server to.
+     * @param int $flags The flags for stream socket server.
+     * @param array|resource|null $context Optional stream context.
+     * @param float|null $timeout Optional timeout for socket operations.
      * @return void 
      */
-    public function __construct(string $address, int $flags = STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context = null) {                
+    public function __construct(string $address, ?int $flags = null, $context = null, ?float $timeout = null) {                
         $this->address = $address;
-        $this->flags = $flags;
+        $this->timeout = $timeout ?? phasync::getDefaultTimeout();
 
         $url = parse_url($address);
         if (
@@ -123,7 +139,17 @@ final class Server {
             case self::PROTO_UDP: break;
             default: throw new LogicException("Scheme " . $url['scheme'] . " not supported. Use 'unix://', 'udp://' or 'tcp://'.");
         }
+
         $this->scheme = $url['scheme'];
+
+        if ($flags === null) {
+            if ($this->scheme === 'udp') {
+                $flags = STREAM_SERVER_BIND;
+            } else {
+                $flags = STREAM_SERVER_BIND | STREAM_SERVER_LISTEN;
+            }
+        }
+        $this->flags = $flags;
 
         if ($context === null) {
             $context = [];
@@ -131,24 +157,7 @@ final class Server {
             $context = stream_context_get_options($context);
         }
 
-        if (empty($context['socket']['backlog'])) {
-            // This setting allows the socket to hold up to 511 pending
-            // connections.
-            $context['socket']['backlog'] = 511;
-        }
-        if (empty($context['socket']['so_reuseport'])) {
-            // This settings allows other processes of the same user to
-            // also accept connections on this socket.
-            $context['socket']['so_reuseport'] = true;
-        }
-        if (empty($context['socket']['tcp_nodelay'])) {
-            // This setting disables Nagle's algorithm, which is generally
-            // a socket level buffer which prevent sending of small packets
-            // immediately. This is disabled by default since we assume that
-            // by sending a small packet, the developer intends it to be
-            // delivered with minimal latency.
-            $context['socket']['tcp_nodelay'] = true;
-        }
+        $context = $this->setDefaultContextOptions($context);
 
         $context = \stream_context_create($context);
 
@@ -169,12 +178,32 @@ final class Server {
         $this->socket = $socket;
     }
 
+    /**
+     * Check if the server is closed.
+     * 
+     * @return bool
+     */
+    public function isClosed(): bool {
+        return !\is_resource($this->socket);
+    }
+
+    /**
+     * Close the server socket.
+     * 
+     * @return void
+     */
+    public function close(): void {
+        if (\is_resource($this->socket)) {
+            \fclose($this->socket);
+        }
+    }
+
     public function getFlags(): int {
         return $this->flags;
     }
 
     /**
-     * Get the address the socket is was connected to.
+     * Get the address the socket is connected to.
      * 
      * Example: 'tcp://123.123.123.123:48273'.
      * 
@@ -196,14 +225,14 @@ final class Server {
     /**
      * Get the port number that the server uses.
      * 
-     * @return int 
+     * @return ?int 
      */
-    public function getPort(): int {
+    public function getPort(): ?int {
         return $this->port;
     }
 
     /**
-     * Get the protocol used by this server
+     * Get the protocol used by this server.
      * 
      * @return self::PROTO_TCP|self::PROTO_UDP|self:PROTO_UNIX
      */
@@ -223,7 +252,7 @@ final class Server {
      * @throws Throwable 
      */
     public function accept(string &$peer_name = null) {
-        phasync::readable($this->socket);
+        phasync::readable($this->socket, $this->timeout);
         $result = \stream_socket_accept($this->socket, 0, $peer_name);
         if (!$result) {
             return false;
@@ -237,7 +266,7 @@ final class Server {
     }
 
     /**
-     * Sends a message to a socket, whether it is connected or not
+     * Sends a message to a socket, whether it is connected or not.
      * 
      * @see https://www.php.net/manual/en/function.stream-socket-sendto.php
      * @param string $data The data to be sent.
@@ -248,7 +277,7 @@ final class Server {
      * @throws Throwable 
      */
     public function sendto(string $data, int $flags = 0, string $address = ""): int|false {
-        phasync::writable($this->socket);
+        phasync::writable($this->socket, $this->timeout);
         return \stream_socket_sendto($this->socket, $data, $flags, $address);
     }
 
@@ -264,7 +293,35 @@ final class Server {
      * @throws Throwable 
      */
     public function recvfrom(int $length, int $flags = 0, ?string &$address = null): string|false {
-        phasync::readable($this->socket);
+        phasync::readable($this->socket, $this->timeout);
         return \stream_socket_recvfrom($this->socket, $length, $flags, $address);
+    }
+
+    /**
+     * Set default context options.
+     * 
+     * @param array $context The context options to set defaults for.
+     * @return array The context options with defaults set.
+     */
+    private function setDefaultContextOptions(array $context): array {
+        if (empty($context['socket']['backlog'])) {
+            // This setting allows the socket to hold up to 511 pending
+            // connections.
+            $context['socket']['backlog'] = 511;
+        }
+        if (empty($context['socket']['so_reuseport'])) {
+            // This setting allows other processes of the same user to
+            // also accept connections on this socket.
+            $context['socket']['so_reuseport'] = true;
+        }
+        if (empty($context['socket']['tcp_nodelay'])) {
+            // This setting disables Nagle's algorithm, which is generally
+            // a socket-level buffer which prevents sending of small packets
+            // immediately. This is disabled by default since we assume that
+            // by sending a small packet, the developer intends it to be
+            // delivered with minimal latency.
+            $context['socket']['tcp_nodelay'] = true;
+        }
+        return $context;
     }
 }
