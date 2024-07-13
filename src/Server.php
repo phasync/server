@@ -113,21 +113,26 @@ final class Server
         $this->address = $address;
         $this->timeout = $timeout ?? \phasync::getDefaultTimeout();
 
-        $url = parse_url($address);
-        if (
-            !is_array($url) || empty($url['scheme'])
-            || ($url['scheme'] !== 'unix' && (empty($url['port']) || empty($url['host'])))
-        ) {
-            throw new \LogicException("The address is in an incorrect format ($address). Valid example: 'tcp://0.0.0.0:8080', 'udp://0.0.0.0:8080', 'unix:///path/to/unix.sock'.");
-        }
-        switch ($url['scheme']) {
-            case self::PROTO_UNIX:
-            case self::PROTO_TCP:
-            case self::PROTO_UDP: break;
-            default: throw new \LogicException('Scheme '.$url['scheme']." not supported. Use 'unix://', 'udp://' or 'tcp://'.");
-        }
+        if (\str_starts_with($address, 'unix://')) {
+            $this->scheme = 'unix';
+        } else {
+            $url = parse_url($address);
+            if (!is_array($url) || empty($url['scheme'])) {
+                throw new \LogicException("The address must include a scheme. Valid examples: 'tcp://0.0.0.0:8080', 'udp://0.0.0.0:8080', 'unix:///path/to/unix.sock'.");
+            }
+            // Ensuring that port and host are present for TCP and UDP, not for UNIX
+            if (($url['scheme'] === self::PROTO_TCP || $url['scheme'] === self::PROTO_UDP)
+                && (empty($url['port']) || empty($url['host']))) {
+                throw new \LogicException("TCP and UDP addresses must include a host and port. Valid example: 'tcp://0.0.0.0:8080'.");
+            }
+            switch ($url['scheme']) {
+                case self::PROTO_TCP:
+                case self::PROTO_UDP: break;
+                default: throw new \LogicException('Scheme '.$url['scheme']." not supported. Use 'unix://', 'udp://' or 'tcp://'.");
+            }
 
-        $this->scheme = $url['scheme'];
+            $this->scheme = $url['scheme'];
+        }
 
         if ($flags === null) {
             if ($this->scheme === 'udp') {
@@ -306,18 +311,28 @@ final class Server
             // connections.
             $context['socket']['backlog'] = 511;
         }
-        if (empty($context['socket']['so_reuseport'])) {
-            // This setting allows other processes of the same user to
-            // also accept connections on this socket.
-            $context['socket']['so_reuseport'] = true;
+
+        if ($this->scheme !== self::PROTO_UNIX) {
+            if (empty($context['socket']['so_reuseport'])) {
+                // This setting allows other processes of the same user to
+                // also accept connections on this socket.
+                $context['socket']['so_reuseport'] = true;
+            }
+        } else {
+            unset($context['socket']['so_reuseport']);
         }
-        if (empty($context['socket']['tcp_nodelay'])) {
-            // This setting disables Nagle's algorithm, which is generally
-            // a socket-level buffer which prevents sending of small packets
-            // immediately. This is disabled by default since we assume that
-            // by sending a small packet, the developer intends it to be
-            // delivered with minimal latency.
-            $context['socket']['tcp_nodelay'] = true;
+
+        if ($this->scheme === self::PROTO_TCP) {
+            if (empty($context['socket']['tcp_nodelay'])) {
+                // This setting disables Nagle's algorithm, which is generally
+                // a socket-level buffer which prevents sending of small packets
+                // immediately. This is disabled by default since we assume that
+                // by sending a small packet, the developer intends it to be
+                // delivered with minimal latency.
+                $context['socket']['tcp_nodelay'] = true;
+            }
+        } else {
+            unset($context['socket']['tcp_nodelay']);
         }
 
         return $context;
