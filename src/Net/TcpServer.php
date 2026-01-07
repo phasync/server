@@ -29,14 +29,28 @@ final class TcpServer
     private array $addresses = [];
 
     private bool $closed = false;
-
+    private bool $wrapStreams;
+    private int $readBuffer;
+    private int $writeBuffer;
 
     /**
      * @param string|string[] $addresses Address(es) to listen on (e.g., '0.0.0.0:8080' or ['0.0.0.0:80', '0.0.0.0:443'])
      * @param array $context Optional stream context options
+     * @param bool $wrapStreams Wrap accepted streams with AsyncStream for transparent async I/O (default: true)
+     * @param int $readBuffer Read buffer size in bytes (0 for unbuffered)
+     * @param int $writeBuffer Write buffer size in bytes (0 for unbuffered)
      */
-    public function __construct(string|array $addresses, array $context = [])
-    {
+    public function __construct(
+        string|array $addresses,
+        array $context = [],
+        bool $wrapStreams = true,
+        int $readBuffer = 0,
+        int $writeBuffer = 0
+    ) {
+        $this->wrapStreams = $wrapStreams;
+        $this->readBuffer = $readBuffer;
+        $this->writeBuffer = $writeBuffer;
+
         if (is_string($addresses)) {
             $addresses = [$addresses];
         }
@@ -79,9 +93,31 @@ final class TcpServer
      */
     public function accept(): Generator
     {
+        // Optimize for single-socket case (most common)
+        if (count($this->sockets) === 1) {
+            $socket = reset($this->sockets);
+            while (!$this->closed && is_resource($socket)) {
+                phasync::readable($socket, PHP_FLOAT_MAX);
+
+                if ($this->closed) {
+                    break;
+                }
+
+                $stream = @stream_socket_accept($socket, 0, $peer);
+                if ($stream) {
+                    stream_set_blocking($stream, false);
+                    stream_set_read_buffer($stream, $this->readBuffer);
+                    stream_set_write_buffer($stream, $this->writeBuffer);
+                    stream_set_chunk_size($stream, 65536);
+                    yield $peer => $this->wrapStreams ? AsyncStream::wrap($stream) : $stream;
+                }
+            }
+            return;
+        }
+
+        // Multi-socket case: use select
         while (!$this->closed && $this->sockets) {
-            // Wait for any socket to become readable
-            $ready = phasync::select([], read: array_values($this->sockets));
+            $ready = phasync::select([], read: array_values($this->sockets), timeout: PHP_FLOAT_MAX);
 
             if ($this->closed || !$ready) {
                 break;
@@ -90,10 +126,10 @@ final class TcpServer
             $stream = @stream_socket_accept($ready, 0, $peer);
             if ($stream) {
                 stream_set_blocking($stream, false);
-                stream_set_read_buffer($stream, 0);
-                stream_set_write_buffer($stream, 0);
+                stream_set_read_buffer($stream, $this->readBuffer);
+                stream_set_write_buffer($stream, $this->writeBuffer);
                 stream_set_chunk_size($stream, 65536);
-                yield $peer => AsyncStream::wrap($stream);
+                yield $peer => $this->wrapStreams ? AsyncStream::wrap($stream) : $stream;
             }
         }
     }
