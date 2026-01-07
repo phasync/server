@@ -1,88 +1,241 @@
 # phasync/server
 
-This library makes it very easy to create an efficient TCP or UDP server in PHP. It wraps the `\stream_socket_server()` with sensible configuration details and enables you to handle multiple concurrent connections very easily.
+> **Note:** This package will be renamed to `phasync/net` in a future release.
 
-## Example HTTP Server
+Efficient TCP and UDP networking for PHP using phasync coroutines.
 
-```php
-// Starts listening to port 8080 on localhost
-Server::serve('tcp://127.0.0.1:8080', function($stream, $peer) {
-    phasync::readable($stream);     // Wait for data from the client
-    fread($stream, 65536);
-    phasync::writable($stream);     // Wait until the client is ready to receive data
-    fwrite($stream, 
-        "HTTP/1.1 200 Ok\r\n".
-        "Connection: close\r\n".
-        "Content-Length: 13\r\n".
-        "\r\n".
-        "Hello, $peer!"
-    );
-    fclose($stream);
-});
+All stream resources are wrapped with `AsyncStream`, providing transparent async I/O - no need to call `phasync::readable()` or `phasync::writable()` manually.
+
+## Installation
+
+```bash
+composer require phasync/server
 ```
 
-## Performance
+## TcpServer
 
-This implementation performs very well, and is in many cases faster than Node.js at handling concurrent connections (up to 50% more requests per second handled in synthetic benchmarks). This performance is due to leveraging `phasync` coroutines and non-blocking IO (the `phasync::readable()` and `phasync::writable()` calls in the example above), along with PHP 8.3 JIT.
-
-## Class Overview
-
-The `Server` class provides a simplified interface for creating efficient network servers. It handles the complexities of socket creation, configuration, and connection management, allowing you to focus on your application logic.
-
-## Class Methods
-
-### `public static function serve(string $address, ?Closure $socketHandler = null, ?float $timeout = null): Fiber`
-
-Creates and starts a TCP or UDP server. For TCP or UNIX socket servers, the handler function must launch a coroutine to handle many connections concurrently.
-
-Parameters:
- * `$address` (string): The address to bind to, in the format `protocol://host:port` (e.g., `tcp://127.0.0.1:8080` or `udp://0.0.0.0:9000`).
- * `$handler` (Closure): For TCP connections, the closure will be run inside a coroutine receiving the stream resource and the peer address as arguments. For UDP connections, the closure will run inside a coroutine receiving the Server instance as an argument.
- * `$timeout` (float|null): Optional timeout for socket operations.
-
-Returns:
-  * `Fiber`
-
-## TCP Example
+Accept TCP connections using a simple iterator pattern:
 
 ```php
-Server::serve('tcp://127.0.0.1:8080', function($stream, $peer) {
-    // ... handle TCP connection
-});
-```
+use phasync\Net\TcpServer;
 
-## UDP Example
+phasync::run(function() {
+    $server = new TcpServer('0.0.0.0:8080');
 
-```php
-Server::serve('udp://127.0.0.1:9000', function(Server $server) {
-    while (true) {
-        $data = $server->recvfrom(65536, 0, $peer);
-        if ($data !== false) {
-            $server->sendto("Response Data", 0, $peer);
-        }
+    foreach ($server->accept() as $peer => $stream) {
+        phasync::go(function() use ($stream, $peer) {
+            $request = fread($stream, 65536);
+
+            fwrite($stream,
+                "HTTP/1.1 200 OK\r\n" .
+                "Connection: close\r\n" .
+                "Content-Length: 13\r\n" .
+                "\r\n" .
+                "Hello, $peer!"
+            );
+            fclose($stream);
+        });
     }
 });
 ```
 
-## Design Decisions
+### Multiple Listen Addresses
 
-### Disabled Read and Write Buffering and Large Chunk Size
+Listen on multiple ports or interfaces simultaneously:
 
-Instead of having PHP manage buffering of reads and writes, developers should try to read and write big chunks of data. Don’t try to read 10 bytes, read 65536 bytes at a time and do the buffering yourself if needed.
+```php
+$server = new TcpServer(['0.0.0.0:80', '0.0.0.0:443']);
 
-When you read big chunks, the benefit of buffering is gone and the end result is slightly faster. Also, the socket works more like a developer would expect.
+foreach ($server->accept() as $peer => $stream) {
+    // Connections from both ports arrive here
+}
+```
 
-In short:
- * Write big chunks for bandwidth
- * Write short chunks for low latency
- * Always read big chunks and process or buffer the data yourself
+### Unix Domain Sockets
 
-### `so_reuseport`
+```php
+$server = new TcpServer('unix:///var/run/myapp.sock');
 
-This is enabled by default. The assumption is that we want to avoid having the network port be busy for a while after the application terminates, for example due to an error. Also, this enables other processes owned by the same user to start listening to the same port, simplifying scaling up the application to multiple processes.
+foreach ($server->accept() as $peer => $stream) {
+    // Handle connection
+}
+```
 
-### TCP Nagle Algorithm
+### API
 
-By default, the Nagle algorithm is disabled. This decision is based on the assumption that if a developer writes a short message to a socket, the developer wants that message delivered quickly. For messages that are longer than a network packet, Nagle has little effect. So generally, we are proponents of letting the developer build larger chunks before writing if the developer intends to, for example, send a full HTML response. See also the chapter above about disabled read/write buffering.
+```php
+// Constructor
+new TcpServer(string|array $addresses, array $context = [])
 
-To enable the Nagle algorithm you must pass a custom stream context to the `phasync\Server` constructor.
+// Accept connections (generator)
+$server->accept(): Generator<string, resource>  // yields peer => stream
+
+// Management
+$server->close(): void
+$server->isClosed(): bool
+$server->getAddresses(): array
+```
+
+## Dns
+
+Async DNS resolution (used automatically by TcpClient):
+
+```php
+use phasync\Net\Dns;
+
+phasync::run(function() {
+    $ip = Dns::resolve('example.com');
+    echo "Resolved to: $ip\n";
+});
+```
+
+Features:
+- Non-blocking UDP queries to system nameserver
+- Reads `/etc/hosts` first
+- Caches results using DNS TTL
+- Falls back to 8.8.8.8 if no nameserver configured
+
+### API
+
+```php
+Dns::resolve(string $hostname, float $timeout = 2.0): ?string
+Dns::clearCache(): void
+```
+
+## TcpClient
+
+Connect to TCP servers asynchronously (with async DNS):
+
+```php
+use phasync\Net\TcpClient;
+
+phasync::run(function() {
+    $conn = TcpClient::connect('example.com:80');
+
+    fwrite($conn, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+    $response = stream_get_contents($conn);
+    fclose($conn);
+
+    echo $response;
+});
+```
+
+### Unix Domain Sockets
+
+```php
+$conn = TcpClient::connectUnix('/var/run/app.sock');
+```
+
+### API
+
+```php
+// Connect to TCP server
+TcpClient::connect(string $address, float $timeout = 30, array $context = []): resource
+
+// Connect to Unix socket
+TcpClient::connectUnix(string $path, float $timeout = 30, array $context = []): resource
+```
+
+## UdpServer
+
+Receive UDP datagrams with correct reply routing:
+
+```php
+use phasync\Net\UdpServer;
+
+phasync::run(function() {
+    $server = new UdpServer('0.0.0.0:9000');
+
+    foreach ($server->receive() as $peer => [$data, $socket]) {
+        // Reply using the same socket (correct interface routing)
+        stream_socket_sendto($socket, "Echo: $data", 0, $peer);
+    }
+});
+```
+
+### Multiple Interfaces
+
+When bound to multiple interfaces, the `$socket` returned ensures replies come from the correct source IP:
+
+```php
+$server = new UdpServer(['192.168.1.10:9000', '10.0.0.10:9000']);
+
+foreach ($server->receive() as $peer => [$data, $socket]) {
+    // $socket is the interface that received the packet
+    // Reply will have the correct source IP
+    stream_socket_sendto($socket, "Reply", 0, $peer);
+}
+```
+
+### API
+
+```php
+// Constructor
+new UdpServer(string|array $addresses, array $context = [])
+
+// Receive datagrams (generator)
+$server->receive(int $maxLength = 65536): Generator<string, array{string, resource}>
+// yields peer => [data, socket]
+
+// Send (for initiating sends, not replies)
+$server->send(string $address, string $data, int $flags = 0): int|false
+
+// Management
+$server->close(): void
+$server->isClosed(): bool
+$server->getAddresses(): array
+```
+
+## Performance
+
+These implementations leverage phasync coroutines and non-blocking I/O for high performance:
+
+- **Zero-copy buffers**: Read/write buffers are disabled for direct kernel access
+- **TCP_NODELAY**: Disabled Nagle algorithm for low-latency responses
+- **SO_REUSEPORT**: Enabled by default for graceful restarts and multi-process scaling
+- **Large chunk size**: 64KB chunks for efficient data transfer
+
+In synthetic benchmarks, this can handle 50% more requests per second than Node.js.
+
+## Design Guidelines
+
+### Read/Write Strategy
+
+- **Read big**: Always read large chunks (65536 bytes) and buffer yourself if needed
+- **Write for your use case**: Large chunks for bandwidth, small chunks for low latency
+
+### Socket Options
+
+| Option | Default | Reason |
+|--------|---------|--------|
+| `so_reuseport` | `true` | Graceful restarts, multi-process scaling |
+| `tcp_nodelay` | `true` | Low-latency delivery of small messages |
+| `backlog` | `511` | Handle connection bursts |
+
+Override via the `$context` parameter:
+
+```php
+$server = new TcpServer('0.0.0.0:8080', [
+    'socket' => [
+        'tcp_nodelay' => false,  // Enable Nagle algorithm
+        'backlog' => 1024,
+    ]
+]);
+```
+
+## Deprecated: Server Class
+
+The original `Server` class is deprecated. Migrate to `TcpServer` or `UdpServer`:
+
+```php
+// Old (deprecated)
+Server::serve('tcp://127.0.0.1:8080', function($stream, $peer) {
+    // handle connection
+});
+
+// New
+$server = new TcpServer('127.0.0.1:8080');
+foreach ($server->accept() as $peer => $stream) {
+    phasync::go(fn() => /* handle connection */);
+}
+```

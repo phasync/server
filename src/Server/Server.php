@@ -8,8 +8,10 @@ use phasync\CancelledException;
 use phasync\IOException;
 
 /**
- * A simple TCP/UDP server implementation allowing you to serve multiple
- * ports at the same time.
+ * A simple TCP/UDP server implementation.
+ *
+ * @deprecated Use TcpServer or UdpServer instead. These provide a cleaner
+ *             iterator-based API and support multiple listen addresses.
  */
 final class Server
 {
