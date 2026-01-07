@@ -82,24 +82,37 @@ Async DNS resolution (used automatically by TcpClient):
 
 ```php
 use phasync\Net\Dns;
+use phasync\Net\DnsRecordType;
 
 phasync::run(function() {
+    // Default: tries A (IPv4) first, then AAAA (IPv6)
     $ip = Dns::resolve('example.com');
-    echo "Resolved to: $ip\n";
+
+    // Explicit IPv4 only
+    $ipv4 = Dns::resolve('example.com', DnsRecordType::A);
+
+    // Explicit IPv6 only
+    $ipv6 = Dns::resolve('example.com', DnsRecordType::AAAA);
 });
 ```
 
 Features:
 - Non-blocking UDP queries to system nameserver
-- Reads `/etc/hosts` first
+- IPv4 (A) and IPv6 (AAAA) support
+- Reads `/etc/hosts` first (both IPv4 and IPv6 entries)
 - Caches results using DNS TTL
 - Falls back to 8.8.8.8 if no nameserver configured
 
 ### API
 
 ```php
-Dns::resolve(string $hostname, float $timeout = 2.0): ?string
+Dns::resolve(string $hostname, DnsRecordType $type = DnsRecordType::ANY, float $timeout = 2.0): ?string
 Dns::clearCache(): void
+
+// DnsRecordType enum
+DnsRecordType::A     // IPv4
+DnsRecordType::AAAA  // IPv6
+DnsRecordType::ANY   // Try A first, then AAAA (default)
 ```
 
 ## TcpClient

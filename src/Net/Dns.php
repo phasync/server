@@ -8,7 +8,7 @@ use function phasync\file_get_contents;
 /**
  * Minimal async DNS resolver for phasync.
  *
- * Performs non-blocking DNS A record lookups using UDP.
+ * Performs non-blocking DNS lookups using UDP.
  *
  * Example:
  * ```php
@@ -22,39 +22,56 @@ final class Dns
     private static ?array $hosts = null;
 
     /**
-     * Resolve hostname to IPv4 address.
+     * Resolve hostname to IP address.
      *
      * @param string $hostname Hostname to resolve
+     * @param DnsRecordType $type Record type (A, AAAA, or ANY)
      * @param float $timeout Timeout in seconds
-     * @return string|null IPv4 address or null on failure
+     * @return string|null IP address or null on failure
      */
-    public static function resolve(string $hostname, float $timeout = 2.0): ?string
-    {
+    public static function resolve(
+        string $hostname,
+        DnsRecordType $type = DnsRecordType::ANY,
+        float $timeout = 2.0
+    ): ?string {
         // Already an IP?
         if (filter_var($hostname, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            return $hostname;
+            return ($type === DnsRecordType::AAAA) ? null : $hostname;
+        }
+        if (filter_var($hostname, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return ($type === DnsRecordType::A) ? null : $hostname;
         }
 
         // Check /etc/hosts
-        $hostsIp = self::checkHosts($hostname);
+        $hostsIp = self::checkHosts($hostname, $type);
         if ($hostsIp !== null) {
             return $hostsIp;
         }
 
         // Check cache
-        if (isset(self::$cache[$hostname])) {
-            if (time() < self::$cache[$hostname]['expires']) {
-                return self::$cache[$hostname]['ip'];
+        $cacheKey = $hostname . ':' . $type->value;
+        if (isset(self::$cache[$cacheKey])) {
+            if (time() < self::$cache[$cacheKey]['expires']) {
+                return self::$cache[$cacheKey]['ip'];
             }
-            unset(self::$cache[$hostname]);
+            unset(self::$cache[$cacheKey]);
+        }
+
+        // For ANY, try A first, then AAAA
+        if ($type === DnsRecordType::ANY) {
+            $result = self::resolve($hostname, DnsRecordType::A, $timeout);
+            if ($result !== null) {
+                return $result;
+            }
+            return self::resolve($hostname, DnsRecordType::AAAA, $timeout);
         }
 
         // Query nameserver
         $nameserver = self::getSystemNameserver();
-        $result = self::query($nameserver, $hostname, $timeout);
+        $result = self::query($nameserver, $hostname, $type, $timeout);
 
         if ($result !== null) {
-            self::$cache[$hostname] = [
+            self::$cache[$cacheKey] = [
                 'ip' => $result['ip'],
                 'expires' => time() + $result['ttl'],
             ];
@@ -72,10 +89,10 @@ final class Dns
         self::$cache = [];
     }
 
-    private static function checkHosts(string $hostname): ?string
+    private static function checkHosts(string $hostname, DnsRecordType $type): ?string
     {
         if (self::$hosts === null) {
-            self::$hosts = [];
+            self::$hosts = ['v4' => [], 'v6' => []];
             $hostsFile = PHP_OS_FAMILY === 'Windows'
                 ? 'C:\\Windows\\System32\\drivers\\etc\\hosts'
                 : '/etc/hosts';
@@ -88,9 +105,16 @@ final class Dns
                         if ($line === '') continue;
 
                         $parts = preg_split('/\s+/', $line);
-                        if (count($parts) >= 2 && filter_var($parts[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-                            for ($i = 1; $i < count($parts); $i++) {
-                                self::$hosts[strtolower($parts[$i])] = $parts[0];
+                        if (count($parts) >= 2) {
+                            $ip = $parts[0];
+                            $isV4 = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
+                            $isV6 = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
+
+                            if ($isV4 || $isV6) {
+                                $key = $isV4 ? 'v4' : 'v6';
+                                for ($i = 1; $i < count($parts); $i++) {
+                                    self::$hosts[$key][strtolower($parts[$i])] = $ip;
+                                }
                             }
                         }
                     }
@@ -98,10 +122,19 @@ final class Dns
             }
         }
 
-        return self::$hosts[strtolower($hostname)] ?? null;
+        $hostLower = strtolower($hostname);
+
+        if ($type === DnsRecordType::A) {
+            return self::$hosts['v4'][$hostLower] ?? null;
+        }
+        if ($type === DnsRecordType::AAAA) {
+            return self::$hosts['v6'][$hostLower] ?? null;
+        }
+        // ANY: prefer v4
+        return self::$hosts['v4'][$hostLower] ?? self::$hosts['v6'][$hostLower] ?? null;
     }
 
-    private static function query(string $server, string $hostname, float $timeout): ?array
+    private static function query(string $server, string $hostname, DnsRecordType $type, float $timeout): ?array
     {
         $socket = @stream_socket_client("udp://$server:53", $errno, $errstr, 0, STREAM_CLIENT_ASYNC_CONNECT);
         if (!$socket) {
@@ -119,7 +152,7 @@ final class Dns
             foreach (explode('.', $hostname) as $label) {
                 $question .= chr(strlen($label)) . $label;
             }
-            $question .= "\0" . pack('nn', 1, 1); // Type A, Class IN
+            $question .= "\0" . pack('nn', $type->value, 1); // Type, Class IN
 
             phasync::writable($socket, $timeout);
             stream_socket_sendto($socket, $header . $question);
@@ -132,10 +165,10 @@ final class Dns
             @fclose($socket);
         }
 
-        return self::parseResponse($response, $id);
+        return self::parseResponse($response, $id, $type);
     }
 
-    private static function parseResponse(string $response, int $expectedId): ?array
+    private static function parseResponse(string $response, int $expectedId, DnsRecordType $type): ?array
     {
         if (strlen($response) < 12) {
             return null;
@@ -181,9 +214,17 @@ final class Dns
             $meta = unpack('ntype/nclass/Nttl/nlen', substr($response, $offset, 10));
             $offset += 10;
 
-            if ($meta['type'] === 1 && $meta['len'] === 4) { // Type A, 4 bytes
+            // Type A (1) = 4 bytes IPv4
+            if ($meta['type'] === 1 && $meta['len'] === 4 && $type === DnsRecordType::A) {
                 $ip = inet_ntop(substr($response, $offset, 4));
-                $ttl = max(60, min($meta['ttl'], 86400)); // Clamp TTL: 1 min to 1 day
+                $ttl = max(60, min($meta['ttl'], 86400));
+                return ['ip' => $ip, 'ttl' => $ttl];
+            }
+
+            // Type AAAA (28) = 16 bytes IPv6
+            if ($meta['type'] === 28 && $meta['len'] === 16 && $type === DnsRecordType::AAAA) {
+                $ip = inet_ntop(substr($response, $offset, 16));
+                $ttl = max(60, min($meta['ttl'], 86400));
                 return ['ip' => $ip, 'ttl' => $ttl];
             }
 
