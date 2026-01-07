@@ -24,6 +24,8 @@ final class Dns
     /**
      * Resolve hostname to IP address.
      *
+     * When multiple records exist, returns one at random for load balancing.
+     *
      * @param string $hostname Hostname to resolve
      * @param DnsRecordType $type Record type (A, AAAA, or ANY)
      * @param float $timeout Timeout in seconds
@@ -34,51 +36,69 @@ final class Dns
         DnsRecordType $type = DnsRecordType::ANY,
         float $timeout = 2.0
     ): ?string {
+        $all = self::resolveAll($hostname, $type, $timeout);
+        if (empty($all)) {
+            return null;
+        }
+        return $all[array_rand($all)];
+    }
+
+    /**
+     * Resolve hostname to all IP addresses.
+     *
+     * @param string $hostname Hostname to resolve
+     * @param DnsRecordType $type Record type (A, AAAA, or ANY)
+     * @param float $timeout Timeout in seconds
+     * @return array<string> Array of IP addresses (empty on failure)
+     */
+    public static function resolveAll(
+        string $hostname,
+        DnsRecordType $type = DnsRecordType::ANY,
+        float $timeout = 2.0
+    ): array {
         // Already an IP?
         if (filter_var($hostname, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            return ($type === DnsRecordType::AAAA) ? null : $hostname;
+            return ($type === DnsRecordType::AAAA) ? [] : [$hostname];
         }
         if (filter_var($hostname, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-            return ($type === DnsRecordType::A) ? null : $hostname;
+            return ($type === DnsRecordType::A) ? [] : [$hostname];
         }
 
         // Check /etc/hosts
         $hostsIp = self::checkHosts($hostname, $type);
         if ($hostsIp !== null) {
-            return $hostsIp;
+            return [$hostsIp];
         }
 
         // Check cache
         $cacheKey = $hostname . ':' . $type->value;
         if (isset(self::$cache[$cacheKey])) {
             if (time() < self::$cache[$cacheKey]['expires']) {
-                return self::$cache[$cacheKey]['ip'];
+                return self::$cache[$cacheKey]['ips'];
             }
             unset(self::$cache[$cacheKey]);
         }
 
-        // For ANY, try A first, then AAAA
+        // For ANY, combine A and AAAA results
         if ($type === DnsRecordType::ANY) {
-            $result = self::resolve($hostname, DnsRecordType::A, $timeout);
-            if ($result !== null) {
-                return $result;
-            }
-            return self::resolve($hostname, DnsRecordType::AAAA, $timeout);
+            $a = self::resolveAll($hostname, DnsRecordType::A, $timeout);
+            $aaaa = self::resolveAll($hostname, DnsRecordType::AAAA, $timeout);
+            return array_merge($a, $aaaa);
         }
 
         // Query nameserver
         $nameserver = self::getSystemNameserver();
         $result = self::query($nameserver, $hostname, $type, $timeout);
 
-        if ($result !== null) {
+        if ($result !== null && !empty($result['ips'])) {
             self::$cache[$cacheKey] = [
-                'ip' => $result['ip'],
+                'ips' => $result['ips'],
                 'expires' => time() + $result['ttl'],
             ];
-            return $result['ip'];
+            return $result['ips'];
         }
 
-        return null;
+        return [];
     }
 
     /**
@@ -199,7 +219,10 @@ final class Dns
         self::skipName($response, $offset);
         $offset += 4; // Type + Class
 
-        // Parse answers
+        // Parse answers - collect all matching IPs
+        $ips = [];
+        $minTtl = 86400;
+
         for ($i = 0; $i < $answerCount; $i++) {
             if ($offset >= strlen($response)) {
                 break;
@@ -216,22 +239,24 @@ final class Dns
 
             // Type A (1) = 4 bytes IPv4
             if ($meta['type'] === 1 && $meta['len'] === 4 && $type === DnsRecordType::A) {
-                $ip = inet_ntop(substr($response, $offset, 4));
-                $ttl = max(60, min($meta['ttl'], 86400));
-                return ['ip' => $ip, 'ttl' => $ttl];
+                $ips[] = inet_ntop(substr($response, $offset, 4));
+                $minTtl = min($minTtl, $meta['ttl']);
             }
 
             // Type AAAA (28) = 16 bytes IPv6
             if ($meta['type'] === 28 && $meta['len'] === 16 && $type === DnsRecordType::AAAA) {
-                $ip = inet_ntop(substr($response, $offset, 16));
-                $ttl = max(60, min($meta['ttl'], 86400));
-                return ['ip' => $ip, 'ttl' => $ttl];
+                $ips[] = inet_ntop(substr($response, $offset, 16));
+                $minTtl = min($minTtl, $meta['ttl']);
             }
 
             $offset += $meta['len'];
         }
 
-        return null;
+        if (empty($ips)) {
+            return null;
+        }
+
+        return ['ips' => $ips, 'ttl' => max(60, min($minTtl, 86400))];
     }
 
     private static function skipName(string $packet, int &$offset): void

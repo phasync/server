@@ -79,3 +79,15 @@ test('Dns returns null for invalid hostname', function () {
         expect($ip)->toBeNull();
     });
 });
+
+test('Dns resolveAll returns array of IPs', function () {
+    phasync::run(function () {
+        Dns::clearCache();
+        $ips = Dns::resolveAll('google.com', DnsRecordType::A, 5.0);
+        expect($ips)->toBeArray();
+        expect($ips)->not->toBeEmpty();
+        foreach ($ips as $ip) {
+            expect(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4))->not->toBeFalse();
+        }
+    });
+});

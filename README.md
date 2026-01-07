@@ -86,7 +86,11 @@ use phasync\Net\DnsRecordType;
 
 phasync::run(function() {
     // Default: tries A (IPv4) first, then AAAA (IPv6)
+    // Returns random IP when multiple records exist (load balancing)
     $ip = Dns::resolve('example.com');
+
+    // Get all IPs for a hostname
+    $allIps = Dns::resolveAll('example.com', DnsRecordType::A);
 
     // Explicit IPv4 only
     $ipv4 = Dns::resolve('example.com', DnsRecordType::A);
@@ -99,6 +103,8 @@ phasync::run(function() {
 Features:
 - Non-blocking UDP queries to system nameserver
 - IPv4 (A) and IPv6 (AAAA) support
+- Random selection for load balancing when multiple records exist
+- `resolveAll()` to get all IPs
 - Reads `/etc/hosts` first (both IPv4 and IPv6 entries)
 - Caches results using DNS TTL
 - Falls back to 8.8.8.8 if no nameserver configured
@@ -107,6 +113,7 @@ Features:
 
 ```php
 Dns::resolve(string $hostname, DnsRecordType $type = DnsRecordType::ANY, float $timeout = 2.0): ?string
+Dns::resolveAll(string $hostname, DnsRecordType $type = DnsRecordType::ANY, float $timeout = 2.0): array
 Dns::clearCache(): void
 
 // DnsRecordType enum
