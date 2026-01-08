@@ -18,6 +18,8 @@ use function phasync\file_get_contents;
  */
 final class Dns
 {
+    private const CACHE_MAX_SIZE = 1000;
+
     private static array $cache = [];
     private static ?array $hosts = null;
 
@@ -70,19 +72,25 @@ final class Dns
             return [$hostsIp];
         }
 
-        // Check cache
+        // Check cache (LRU: unset and reinsert to move to end)
         $cacheKey = $hostname . ':' . $type->value;
         if (isset(self::$cache[$cacheKey])) {
-            if (time() < self::$cache[$cacheKey]['expires']) {
-                return self::$cache[$cacheKey]['ips'];
-            }
+            $entry = self::$cache[$cacheKey];
             unset(self::$cache[$cacheKey]);
+            if (time() < $entry['expires']) {
+                self::$cache[$cacheKey] = $entry;
+                return $entry['ips'];
+            }
         }
 
-        // For ANY, combine A and AAAA results
+        // For ANY, query A and AAAA in parallel
         if ($type === DnsRecordType::ANY) {
-            $a = self::resolveAll($hostname, DnsRecordType::A, $timeout);
-            $aaaa = self::resolveAll($hostname, DnsRecordType::AAAA, $timeout);
+            $aFiber = phasync::go(fn() => self::resolveAll($hostname, DnsRecordType::A, $timeout));
+            $aaaaFiber = phasync::go(fn() => self::resolveAll($hostname, DnsRecordType::AAAA, $timeout));
+
+            $a = phasync::await($aFiber);
+            $aaaa = phasync::await($aaaaFiber);
+
             return array_merge($a, $aaaa);
         }
 
@@ -91,6 +99,10 @@ final class Dns
         $result = self::query($nameserver, $hostname, $type, $timeout);
 
         if ($result !== null && !empty($result['ips'])) {
+            // Evict oldest entries if cache is full
+            while (count(self::$cache) >= self::CACHE_MAX_SIZE) {
+                array_shift(self::$cache);
+            }
             self::$cache[$cacheKey] = [
                 'ips' => $result['ips'],
                 'expires' => time() + $result['ttl'],
@@ -156,36 +168,54 @@ final class Dns
 
     private static function query(string $server, string $hostname, DnsRecordType $type, float $timeout): ?array
     {
-        $socket = @stream_socket_client("udp://$server:53", $errno, $errstr, 0, STREAM_CLIENT_ASYNC_CONNECT);
-        if (!$socket) {
-            return null;
+        // Build DNS query packet
+        $id = random_int(0, 65535);
+        $header = pack('n6', $id, 0x0100, 1, 0, 0, 0); // Standard query, recursion desired
+
+        $question = '';
+        foreach (explode('.', $hostname) as $label) {
+            $question .= chr(strlen($label)) . $label;
         }
+        $question .= "\0" . pack('nn', $type->value, 1); // Type, Class IN
+        $packet = $header . $question;
 
-        stream_set_blocking($socket, false);
+        // Retry with exponential backoff (1s, 2s like libc)
+        $attempts = [1.0, 2.0];
+        $deadline = microtime(true) + $timeout;
 
-        try {
-            // Build DNS query
-            $id = random_int(0, 65535);
-            $header = pack('n6', $id, 0x0100, 1, 0, 0, 0); // Standard query, recursion desired
-
-            $question = '';
-            foreach (explode('.', $hostname) as $label) {
-                $question .= chr(strlen($label)) . $label;
+        foreach ($attempts as $attemptTimeout) {
+            $remaining = $deadline - microtime(true);
+            if ($remaining <= 0) {
+                break;
             }
-            $question .= "\0" . pack('nn', $type->value, 1); // Type, Class IN
+            $attemptTimeout = min($attemptTimeout, $remaining);
 
-            phasync::writable($socket, $timeout);
-            stream_socket_sendto($socket, $header . $question);
+            $socket = @stream_socket_client("udp://$server:53", $errno, $errstr, 0, STREAM_CLIENT_ASYNC_CONNECT);
+            if (!$socket) {
+                continue;
+            }
 
-            phasync::readable($socket, $timeout);
-            $response = fread($socket, 512);
-        } catch (\Throwable) {
-            return null;
-        } finally {
-            @fclose($socket);
+            stream_set_blocking($socket, false);
+
+            try {
+                phasync::writable($socket, $attemptTimeout);
+                stream_socket_sendto($socket, $packet);
+
+                phasync::readable($socket, $attemptTimeout);
+                $response = fread($socket, 512);
+
+                $result = self::parseResponse($response, $id, $type);
+                if ($result !== null) {
+                    return $result;
+                }
+            } catch (\Throwable) {
+                // Timeout or error, retry
+            } finally {
+                @fclose($socket);
+            }
         }
 
-        return self::parseResponse($response, $id, $type);
+        return null;
     }
 
     private static function parseResponse(string $response, int $expectedId, DnsRecordType $type): ?array
