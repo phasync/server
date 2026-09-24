@@ -3,209 +3,208 @@
 use phasync\Net\TcpServer;
 use phasync\Util\WaitGroup;
 
-// --- Helper to find a free port ---
-function get_free_port(): int {
-    $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-    socket_bind($sock, '127.0.0.1', 0);
-    socket_getsockname($sock, $addr, $port);
-    socket_close($sock);
-    return $port;
-}
+test('TcpServer binds to port 0 and reports the real address', function () {
+    $server = new TcpServer('127.0.0.1:0');
+    expect($server->getAddress())->toMatch('/^127\.0\.0\.1:[1-9][0-9]*$/');
+    $server->close();
+});
 
-test('TcpServer accepts connections with foreach', function () {
-    phasync::run(function () {
-        $port = get_free_port();
-        $server = new TcpServer("127.0.0.1:$port");
+test('TcpServer accepts a connection with foreach and yields peer => stream', function () {
+    $result = phasync::run(function () {
+        $server = new TcpServer('127.0.0.1:0');
+        $got    = null;
 
-        expect($server->getAddresses())->toHaveCount(1);
-        expect($server->isClosed())->toBeFalse();
-
-        $connectionHandled = false;
-
-        // Server coroutine - handle one connection then close
-        phasync::go(function () use ($server, &$connectionHandled) {
-            foreach ($server->accept() as $addr => $stream) {
-                expect($addr)->toBeString();
-                expect($stream)->toBeResource();
-
-                // AsyncStream handles blocking automatically
-                $data = fread($stream, 65536);
-                $connectionHandled = true;  // Set before write (fwrite yields)
-                fwrite($stream, "Got: $data");
+        phasync::go(function () use ($server, &$got) {
+            foreach ($server->accept() as $peer => $stream) {
+                $got  = [$peer, fread(phasync::readable($stream), 65536)];
+                fwrite(phasync::writable($stream), 'Got: ' . $got[1]);
                 fclose($stream);
-
                 $server->close();
-                break;
             }
         });
 
-        // Client - connect and exchange data
-        $client = stream_socket_client("tcp://127.0.0.1:$port");
+        $client = stream_socket_client('tcp://' . $server->getAddress());
         stream_set_blocking($client, false);
-        fwrite(phasync::writable($client), "Hello");
+        fwrite(phasync::writable($client), 'Hello');
         $response = fread(phasync::readable($client), 65536);
         fclose($client);
 
-        expect($response)->toContain("Got: Hello");
-        expect($connectionHandled)->toBeTrue();
+        return [$got, $response];
     });
+
+    [[$peer, $data], $response] = $result;
+    expect($peer)->toMatch('/^127\.0\.0\.1:[0-9]+$/');
+    expect($data)->toBe('Hello');
+    expect($response)->toBe('Got: Hello');
 });
 
-test('TcpServer can listen on multiple addresses', function () {
-    phasync::run(function () {
-        $port1 = get_free_port();
-        $port2 = get_free_port();
-        $server = new TcpServer(["127.0.0.1:$port1", "127.0.0.1:$port2"]);
-
-        expect($server->getAddresses())->toHaveCount(2);
-
+test('TcpServer yields plain stream resources, not AsyncStream-wrapped ones', function () {
+    $meta = phasync::run(function () {
+        $server = new TcpServer('127.0.0.1:0');
+        $client = stream_socket_client('tcp://' . $server->getAddress());
+        foreach ($server->accept() as $stream) {
+            $meta = stream_get_meta_data($stream);
+            fclose($stream);
+            break;
+        }
+        fclose($client);
         $server->close();
+
+        return $meta;
     });
+
+    expect($meta['stream_type'])->toBe('tcp_socket/ssl');
+    expect($meta['wrapper_type'] ?? null)->not->toBe('user-space');
+    expect($meta['blocked'])->toBeFalse();
 });
 
-test('TcpServer accepts from multiple sockets', function () {
-    phasync::run(function () {
-        $port1 = get_free_port();
-        $port2 = get_free_port();
-        $server = new TcpServer(["127.0.0.1:$port1", "127.0.0.1:$port2"]);
-        $connections = [];
+test('TcpServer takes connections already waiting in the queue without suspending', function () {
+    // With N connections queued, accepting all of them must not wait for the event loop
+    // between connections: a sibling coroutine counting its turns must get none.
+    $result = phasync::run(function () {
+        $server  = new TcpServer('127.0.0.1:0');
+        $clients = [];
+        for ($i = 0; $i < 20; ++$i) {
+            $clients[] = stream_socket_client('tcp://' . $server->getAddress());
+        }
+        phasync::sleep(0.05); // let the kernel finish the handshakes into the accept queue
 
-        // Server coroutine
-        phasync::go(function () use ($server, &$connections) {
-            foreach ($server->accept() as $addr => $stream) {
-                // AsyncStream handles blocking automatically
-                $data = fread($stream, 65536);
-                $connections[] = $data;  // Record before write (fwrite yields)
-                fwrite($stream, "Got: $data");
-                fclose($stream);
-
-                if (count($connections) >= 2) {
-                    $server->close();
-                    break;
-                }
+        $turns   = 0;
+        $stop    = false;
+        $sibling = phasync::go(function () use (&$turns, &$stop) {
+            while (!$stop) {
+                ++$turns;
+                phasync::sleep(0);
             }
         });
 
-        // Connect to both ports
-        $client1 = stream_socket_client("tcp://127.0.0.1:$port1");
-        $client2 = stream_socket_client("tcp://127.0.0.1:$port2");
-        stream_set_blocking($client1, false);
-        stream_set_blocking($client2, false);
+        $before   = $turns;
+        $accepted = [];
+        foreach ($server->accept() as $stream) {
+            $accepted[] = $stream;
+            if (20 === count($accepted)) {
+                break;
+            }
+        }
+        $siblingTurns = $turns - $before;
 
-        fwrite(phasync::writable($client1), "from-port-1");
-        fwrite(phasync::writable($client2), "from-port-2");
+        $stop = true;
+        phasync::await($sibling);
+        foreach (array_merge($clients, $accepted) as $s) {
+            fclose($s);
+        }
+        $server->close();
 
-        $resp1 = fread(phasync::readable($client1), 65536);
-        $resp2 = fread(phasync::readable($client2), 65536);
-
-        fclose($client1);
-        fclose($client2);
-
-        expect($resp1)->toContain("Got: from-port-1");
-        expect($resp2)->toContain("Got: from-port-2");
-        expect($connections)->toHaveCount(2);
+        return [count($accepted), $siblingTurns];
     });
+
+    expect($result)->toBe([20, 0]);
 });
 
-test('TcpServer throws on invalid address', function () {
-    expect(fn() => @new TcpServer('invalid:99999'))
-        ->toThrow(RuntimeException::class);
+test('closing the server ends a waiting accept() loop without an exception', function () {
+    $result = phasync::run(function () {
+        $server = new TcpServer('127.0.0.1:0');
+        $loop   = phasync::go(function () use ($server) {
+            foreach ($server->accept() as $stream) {
+                fclose($stream);
+            }
+
+            return 'loop ended';
+        });
+        phasync::sleep(0.05); // the loop is now waiting for a connection
+        $server->close();
+
+        return [phasync::await($loop), $server->isClosed()];
+    });
+
+    expect($result)->toBe(['loop ended', true]);
+});
+
+test('TcpServer throws on an address it cannot bind', function () {
+    expect(fn () => new TcpServer('invalid:99999'))->toThrow(RuntimeException::class);
 });
 
 test('TcpServer handles concurrent connections', function () {
     phasync::run(function () {
-        $port = get_free_port();
-        $server = new TcpServer("127.0.0.1:$port");
-        $wg = new WaitGroup();
-        $count = 10; // Reduced from 50 for faster test
+        $server = new TcpServer('127.0.0.1:0');
+        $wg     = new WaitGroup();
+        $count  = 10;
 
-        // Server: Echo with delay to prove concurrency
+        // Echo with a delay, to prove the connections are handled concurrently.
         phasync::go(function () use ($server, $count) {
             $handled = 0;
             foreach ($server->accept() as $conn) {
-                phasync::go(function() use ($conn) {
+                phasync::go(function () use ($conn) {
                     phasync::sleep(0.05);
-                    fwrite($conn, "Done");
+                    fwrite(phasync::writable($conn), 'Done');
                     fclose($conn);
                 });
-                $handled++;
-                if ($handled >= $count) {
+                if (++$handled >= $count) {
                     $server->close();
-                    break;
                 }
             }
         });
 
-        // Spawn clients
         $start = microtime(true);
-        for ($i = 0; $i < $count; $i++) {
+        for ($i = 0; $i < $count; ++$i) {
             $wg->add();
-            phasync::go(function() use ($port, $wg) {
+            phasync::go(function () use ($server, $wg) {
                 try {
-                    $client = stream_socket_client("tcp://127.0.0.1:$port");
+                    $client = stream_socket_client('tcp://' . $server->getAddress());
                     stream_set_blocking($client, false);
-                    phasync::readable($client);
-                    $res = fread($client, 1024);
-                    expect($res)->toBe("Done");
+                    expect(fread(phasync::readable($client), 1024))->toBe('Done');
                     fclose($client);
                 } finally {
                     $wg->done();
                 }
             });
         }
-
         $wg->await();
-        $duration = microtime(true) - $start;
 
-        // Sequential would be 10 * 0.05s = 0.5s, parallel should be ~0.05s + overhead
-        expect($duration)->toBeLessThan(0.3);
+        // Sequential would take 10 * 0.05 s = 0.5 s.
+        expect(microtime(true) - $start)->toBeLessThan(0.3);
     });
 });
 
 test('TcpServer handles large payloads', function () {
     phasync::run(function () {
-        $port = get_free_port();
-        $server = new TcpServer("127.0.0.1:$port");
+        $server = new TcpServer('127.0.0.1:0');
 
-        // Server: Read 1MB and return hash
+        // Read 1 MB, reply with its hash.
         phasync::go(function () use ($server) {
             foreach ($server->accept() as $conn) {
                 $buffer = '';
-                while (!feof($conn)) {
-                    phasync::readable($conn);
-                    $chunk = fread($conn, 65536);
-                    if ($chunk === false || $chunk === '') break;
+                while (true) {
+                    $chunk = fread(phasync::readable($conn), 65536);
+                    if ('' === $chunk || false === $chunk) {
+                        if (feof($conn)) {
+                            break;
+                        }
+                        continue;
+                    }
                     $buffer .= $chunk;
                 }
                 fwrite(phasync::writable($conn), md5($buffer));
                 fclose($conn);
                 $server->close();
-                break;
             }
         });
 
-        // Client: Send 1MB
-        $client = stream_socket_client("tcp://127.0.0.1:$port");
+        $client = stream_socket_client('tcp://' . $server->getAddress());
         stream_set_blocking($client, false);
-
-        $payload = str_repeat("X", 1024 * 1024);
-        $hash = md5($payload);
-
-        $offset = 0;
-        $len = strlen($payload);
-        while ($offset < $len) {
-            phasync::writable($client);
-            $written = fwrite($client, substr($payload, $offset, 65536));
-            if ($written === false) break;
+        $payload = str_repeat('X', 1024 * 1024);
+        $offset  = 0;
+        while ($offset < strlen($payload)) {
+            $written = fwrite(phasync::writable($client), substr($payload, $offset, 65536));
+            if (false === $written) {
+                break;
+            }
             $offset += $written;
         }
-
         stream_socket_shutdown($client, STREAM_SHUT_WR);
-
-        phasync::readable($client);
-        $response = fread($client, 1024);
+        $response = fread(phasync::readable($client), 1024);
         fclose($client);
 
-        expect($response)->toBe($hash);
+        expect($response)->toBe(md5($payload));
     });
 });

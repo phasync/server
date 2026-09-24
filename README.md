@@ -2,9 +2,10 @@
 
 > **Note:** This package will be renamed to `phasync/net` in a future release.
 
-Efficient TCP and UDP networking for PHP using phasync coroutines.
+TCP, UDP and Unix socket networking for PHP using phasync coroutines.
 
-All stream resources are wrapped with `AsyncStream`, providing transparent async I/O - no need to call `phasync::readable()` or `phasync::writable()` manually.
+The design follows Go's `net` package: a server listens on one address and hands you
+connections from a plain loop, and you start one coroutine per connection.
 
 ## Installation
 
@@ -12,24 +13,25 @@ All stream resources are wrapped with `AsyncStream`, providing transparent async
 composer require phasync/server
 ```
 
-## TcpServer
+For production, also see [the phasync extension](#the-phasync-extension) and
+[JIT](#jit).
 
-Accept TCP connections using a simple iterator pattern:
+## TcpServer
 
 ```php
 use phasync\Net\TcpServer;
 
-phasync::run(function() {
+phasync::run(function () {
     $server = new TcpServer('0.0.0.0:8080');
 
     foreach ($server->accept() as $peer => $stream) {
-        phasync::go(function() use ($stream, $peer) {
-            $request = fread($stream, 65536);
+        phasync::go(function () use ($stream, $peer) {
+            $request = fread(phasync::readable($stream), 65536);
 
-            fwrite($stream,
+            fwrite(phasync::writable($stream),
                 "HTTP/1.1 200 OK\r\n" .
                 "Connection: close\r\n" .
-                "Content-Length: 13\r\n" .
+                "Content-Length: " . strlen("Hello, $peer!") . "\r\n" .
                 "\r\n" .
                 "Hello, $peer!"
             );
@@ -39,223 +41,246 @@ phasync::run(function() {
 });
 ```
 
-### Multiple Listen Addresses
+Accepted connections are plain non-blocking stream resources. Call `phasync::readable()` /
+`phasync::writable()` before reading or writing, so the coroutine waits instead of getting
+an empty read. With the phasync extension loaded, plain `fread()` / `fwrite()` wait by
+themselves.
 
-Listen on multiple ports or interfaces simultaneously:
+`accept()` takes every connection already waiting in the kernel's queue before waiting
+again, so a burst of new connections is admitted at once. The loop ends when the server is
+closed (`$server->close()` from any coroutine).
+
+### Several addresses
+
+A server listens on one address. For several, run one accept loop per address:
 
 ```php
-$server = new TcpServer(['0.0.0.0:80', '0.0.0.0:443']);
-
-foreach ($server->accept() as $peer => $stream) {
-    // Connections from both ports arrive here
+foreach (['0.0.0.0:80', '0.0.0.0:8080'] as $address) {
+    phasync::go(function () use ($address) {
+        $server = new TcpServer($address);
+        foreach ($server->accept() as $peer => $stream) {
+            phasync::go(fn () => handle($stream, $peer));
+        }
+    });
 }
 ```
 
-### Unix Domain Sockets
+To handle connections from all of them in one place, have each loop write to a shared
+channel instead:
 
 ```php
-$server = new TcpServer('unix:///var/run/myapp.sock');
+phasync::channel($connections, $newConnection);
 
-foreach ($server->accept() as $peer => $stream) {
-    // Handle connection
+foreach (['0.0.0.0:80', '0.0.0.0:8080'] as $address) {
+    phasync::go(function () use ($address, $newConnection) {
+        $server = new TcpServer($address);
+        foreach ($server->accept() as $peer => $stream) {
+            $newConnection->write([$peer, $stream]);
+        }
+    });
 }
+
+phasync::go(function () use ($connections) {
+    foreach ($connections as [$peer, $stream]) {
+        phasync::go(fn () => handle($stream, $peer));
+    }
+});
+```
+
+Read the channel from its own coroutine, as above, not from the coroutine that created it:
+phasync currently treats a channel's creator waiting on it for more than 100 ms as a likely
+deadlock and throws.
+
+### Unix domain sockets
+
+```php
+$server = new TcpServer('unix:///run/myapp.sock');
+```
+
+`close()` removes the socket file, so the path can be bound again after a restart.
+
+### Port 0
+
+Binding to port 0 picks a free port; `getAddress()` returns the real one:
+
+```php
+$server = new TcpServer('127.0.0.1:0');
+echo $server->getAddress(); // 127.0.0.1:43127
 ```
 
 ### API
 
 ```php
-// Constructor
-new TcpServer(string|array $addresses, array $context = [])
+new TcpServer(string $address, array $context = [])
 
-// Accept connections (generator)
 $server->accept(): Generator<string, resource>  // yields peer => stream
-
-// Management
 $server->close(): void
 $server->isClosed(): bool
-$server->getAddresses(): array
+$server->getAddress(): string
+```
+
+## UdpServer
+
+```php
+use phasync\Net\UdpServer;
+
+phasync::run(function () {
+    $server = new UdpServer('0.0.0.0:9000');
+
+    foreach ($server->receive() as $peer => $data) {
+        $server->send($peer, "Echo: $data");
+    }
+});
+```
+
+`receive()` takes every datagram already waiting before waiting again. One server is one
+socket; for several addresses, run one receive loop per address as with `TcpServer`.
+
+### API
+
+```php
+new UdpServer(string $address, array $context = [])
+
+$server->receive(int $maxLength = 65536): Generator<string, string>  // yields peer => data
+$server->send(string $address, string $data, int $flags = 0): int|false
+$server->close(): void
+$server->isClosed(): bool
+$server->getAddress(): string
+```
+
+## TcpClient
+
+Connect without blocking the event loop, including DNS resolution:
+
+```php
+use phasync\Net\TcpClient;
+
+phasync::run(function () {
+    $conn = TcpClient::connect('example.com:80');
+
+    fwrite(phasync::writable($conn), "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+    while (!feof($conn)) {
+        echo fread(phasync::readable($conn), 65536);
+    }
+    fclose($conn);
+});
+```
+
+```php
+TcpClient::connect(string $address, float $timeout = 30, array $context = []): resource
+TcpClient::connectUnix(string $path, float $timeout = 30, array $context = []): resource
 ```
 
 ## Dns
 
-Async DNS resolution (used automatically by TcpClient):
+Async DNS resolution (used automatically by `TcpClient`):
 
 ```php
 use phasync\Net\Dns;
 use phasync\Net\DnsRecordType;
 
-phasync::run(function() {
-    // Default: tries A (IPv4) first, then AAAA (IPv6)
-    // Returns random IP when multiple records exist (load balancing)
+phasync::run(function () {
+    // Default: tries A (IPv4) first, then AAAA (IPv6).
+    // Returns a random IP when there are several records.
     $ip = Dns::resolve('example.com');
 
-    // Get all IPs for a hostname
     $allIps = Dns::resolveAll('example.com', DnsRecordType::A);
-
-    // Explicit IPv4 only
-    $ipv4 = Dns::resolve('example.com', DnsRecordType::A);
-
-    // Explicit IPv6 only
-    $ipv6 = Dns::resolve('example.com', DnsRecordType::AAAA);
+    $ipv4   = Dns::resolve('example.com', DnsRecordType::A);
+    $ipv6   = Dns::resolve('example.com', DnsRecordType::AAAA);
 });
 ```
 
-Features:
-- Non-blocking UDP queries to system nameserver
-- IPv4 (A) and IPv6 (AAAA) support
-- Random selection for load balancing when multiple records exist
-- `resolveAll()` to get all IPs
-- Reads `/etc/hosts` first (both IPv4 and IPv6 entries)
-- Caches results using DNS TTL
-- Falls back to 8.8.8.8 if no nameserver configured
-
-### API
+- Non-blocking UDP queries to the system nameserver
+- IPv4 (A) and IPv6 (AAAA)
+- Reads `/etc/hosts` first
+- Caches results using the DNS TTL
+- Falls back to 8.8.8.8 if no nameserver is configured
 
 ```php
 Dns::resolve(string $hostname, DnsRecordType $type = DnsRecordType::ANY, float $timeout = 2.0): ?string
 Dns::resolveAll(string $hostname, DnsRecordType $type = DnsRecordType::ANY, float $timeout = 2.0): array
 Dns::clearCache(): void
-
-// DnsRecordType enum
-DnsRecordType::A     // IPv4
-DnsRecordType::AAAA  // IPv6
-DnsRecordType::ANY   // Try A first, then AAAA (default)
 ```
 
-## TcpClient
+## Socket options
 
-Connect to TCP servers asynchronously (with async DNS):
+| Option | Default | Why |
+|--------|---------|-----|
+| `backlog` | `65535` | Room for connection bursts. The kernel caps it at its own limit (`net.core.somaxconn` on Linux), so a high value is safe. |
+| `so_reuseport` | `true` | Several processes can listen on the same port, for multi-process scaling and graceful restarts. |
+| `tcp_nodelay` | `true` | Small responses are sent immediately instead of waiting to be batched. |
 
-```php
-use phasync\Net\TcpClient;
-
-phasync::run(function() {
-    $conn = TcpClient::connect('example.com:80');
-
-    fwrite($conn, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
-    $response = stream_get_contents($conn);
-    fclose($conn);
-
-    echo $response;
-});
-```
-
-### Unix Domain Sockets
-
-```php
-$conn = TcpClient::connectUnix('/var/run/app.sock');
-```
-
-### API
-
-```php
-// Connect to TCP server
-TcpClient::connect(string $address, float $timeout = 30, array $context = []): resource
-
-// Connect to Unix socket
-TcpClient::connectUnix(string $path, float $timeout = 30, array $context = []): resource
-```
-
-## UdpServer
-
-Receive UDP datagrams with correct reply routing:
-
-```php
-use phasync\Net\UdpServer;
-
-phasync::run(function() {
-    $server = new UdpServer('0.0.0.0:9000');
-
-    foreach ($server->receive() as $peer => [$data, $socket]) {
-        // Reply using the same socket (correct interface routing)
-        stream_socket_sendto($socket, "Echo: $data", 0, $peer);
-    }
-});
-```
-
-### Multiple Interfaces
-
-When bound to multiple interfaces, the `$socket` returned ensures replies come from the correct source IP:
-
-```php
-$server = new UdpServer(['192.168.1.10:9000', '10.0.0.10:9000']);
-
-foreach ($server->receive() as $peer => [$data, $socket]) {
-    // $socket is the interface that received the packet
-    // Reply will have the correct source IP
-    stream_socket_sendto($socket, "Reply", 0, $peer);
-}
-```
-
-### API
-
-```php
-// Constructor
-new UdpServer(string|array $addresses, array $context = [])
-
-// Receive datagrams (generator)
-$server->receive(int $maxLength = 65536): Generator<string, array{string, resource}>
-// yields peer => [data, socket]
-
-// Send (for initiating sends, not replies)
-$server->send(string $address, string $data, int $flags = 0): int|false
-
-// Management
-$server->close(): void
-$server->isClosed(): bool
-$server->getAddresses(): array
-```
-
-## Performance
-
-These implementations leverage phasync coroutines and non-blocking I/O for high performance:
-
-- **Zero-copy buffers**: Read/write buffers are disabled for direct kernel access
-- **TCP_NODELAY**: Disabled Nagle algorithm for low-latency responses
-- **SO_REUSEPORT**: Enabled by default for graceful restarts and multi-process scaling
-- **Large chunk size**: 64KB chunks for efficient data transfer
-
-In synthetic benchmarks, this can handle 50% more requests per second than Node.js.
-
-## Design Guidelines
-
-### Read/Write Strategy
-
-- **Read big**: Always read large chunks (65536 bytes) and buffer yourself if needed
-- **Write for your use case**: Large chunks for bandwidth, small chunks for low latency
-
-### Socket Options
-
-| Option | Default | Reason |
-|--------|---------|--------|
-| `so_reuseport` | `true` | Graceful restarts, multi-process scaling |
-| `tcp_nodelay` | `true` | Low-latency delivery of small messages |
-| `backlog` | `511` | Handle connection bursts |
-
-Override via the `$context` parameter:
+Override them with `$context`:
 
 ```php
 $server = new TcpServer('0.0.0.0:8080', [
-    'socket' => [
-        'tcp_nodelay' => false,  // Enable Nagle algorithm
-        'backlog' => 1024,
-    ]
+    'socket' => ['tcp_nodelay' => false],
 ]);
 ```
 
-## Deprecated: Server Class
+## Production
+
+### The phasync extension
+
+phasync waits for sockets with `stream_select()`, which in PHP fails for any file descriptor
+numbered 1024 or higher. A server with more than roughly 1,000 open connections hits that.
+The [phasync extension](https://github.com/phasync/phasync-ext) replaces it with a version
+without that limit, and also makes plain `fread()` / `fwrite()` suspend the coroutine. It is
+CLI only.
+
+```bash
+composer require phasync/phasync-ext
+```
+
+```php
+phasync\try_enable_ext(); // first line of your script; may restart the process once
+```
+
+### JIT
+
+PHP's JIT is off by default on the command line. For a server, turn it on:
+
+```bash
+php -d opcache.enable_cli=1 -d opcache.jit=tracing -d opcache.jit_buffer_size=128M server.php
+```
+
+In the benchmark below it added 8–18% throughput.
+
+## Benchmark
+
+Hello-world keep-alive HTTP responder on raw sockets (no HTTP library), one process each:
+`TcpServer` with the phasync extension and JIT, and node v18 with the `net` module.
+`wrk -t8 -d10s` on a Ryzen 9 9950X3D:
+
+| Connections | phasync req/s | node req/s | phasync p99 | node p99 |
+|---|---|---|---|---|
+| 100 | 248k | 266k | 0.51 ms | 0.48 ms |
+| 900 | 222k | 250k | 4.9 ms | 381 ms |
+| 10,000 | 105k | 154k* | 98 ms | 26 ms* |
+
+\* At 10,000 connections node had only accepted about 7,500 of them after 5 seconds, with
+352 timeouts and 52 read errors, so it was serving fewer clients. phasync had all 10,000
+connections accepted with no errors.
+
+This handler does almost nothing per request, which favours node: its event loop runs in C
+while phasync's runs in PHP. With more work per request, phasync's per-request overhead is
+lower: waiting on I/O suspends a fiber, where node allocates promises for every `await`.
+
+The scripts are in [`benchmarking/`](benchmarking/).
+
+## Deprecated: Server class
 
 The original `Server` class is deprecated. Migrate to `TcpServer` or `UdpServer`:
 
 ```php
 // Old (deprecated)
-Server::serve('tcp://127.0.0.1:8080', function($stream, $peer) {
+Server::serve('tcp://127.0.0.1:8080', function ($stream, $peer) {
     // handle connection
 });
 
 // New
 $server = new TcpServer('127.0.0.1:8080');
 foreach ($server->accept() as $peer => $stream) {
-    phasync::go(fn() => /* handle connection */);
+    phasync::go(fn () => /* handle connection */);
 }
 ```

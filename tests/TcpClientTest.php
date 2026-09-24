@@ -1,78 +1,79 @@
 <?php
 
-use phasync\Net\TcpServer;
 use phasync\Net\TcpClient;
-
-function get_client_test_port(): int {
-    $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-    socket_bind($sock, '127.0.0.1', 0);
-    socket_getsockname($sock, $addr, $port);
-    socket_close($sock);
-    return $port;
-}
+use phasync\Net\TcpServer;
 
 test('TcpClient connects and exchanges data', function () {
-    phasync::run(function () {
-        $port = get_client_test_port();
-        $server = new TcpServer("127.0.0.1:$port");
+    $response = phasync::run(function () {
+        $server = new TcpServer('127.0.0.1:0');
 
-        // Server coroutine
         phasync::go(function () use ($server) {
             foreach ($server->accept() as $stream) {
-                $data = fread($stream, 65536);
-                fwrite($stream, "Echo: $data");
+                $data = fread(phasync::readable($stream), 65536);
+                fwrite(phasync::writable($stream), "Echo: $data");
                 fclose($stream);
                 $server->close();
-                break;
             }
         });
 
-        // Client using TcpClient - AsyncStream handles blocking
-        $client = TcpClient::connect("127.0.0.1:$port");
-        expect($client)->toBeResource();
-
-        fwrite($client, "Hello");
-        $response = fread($client, 65536);
+        $client = TcpClient::connect($server->getAddress());
+        fwrite(phasync::writable($client), 'Hello');
+        $response = fread(phasync::readable($client), 65536);
         fclose($client);
 
-        expect($response)->toBe("Echo: Hello");
+        return $response;
     });
+
+    expect($response)->toBe('Echo: Hello');
+});
+
+test('TcpClient returns a plain non-blocking stream, not an AsyncStream-wrapped one', function () {
+    $meta = phasync::run(function () {
+        $server = new TcpServer('127.0.0.1:0');
+        $client = TcpClient::connect($server->getAddress());
+        $meta   = stream_get_meta_data($client);
+        fclose($client);
+        $server->close();
+
+        return $meta;
+    });
+
+    expect($meta['stream_type'])->toBe('tcp_socket/ssl');
+    expect($meta['wrapper_type'] ?? null)->not->toBe('user-space');
+    expect($meta['blocked'])->toBeFalse();
 });
 
 test('TcpClient throws on refused connection', function () {
     phasync::run(function () {
         // Port 1 requires root and is almost certainly not listening
-        expect(fn() => TcpClient::connect('127.0.0.1:1', timeout: 0.5))
+        expect(fn () => TcpClient::connect('127.0.0.1:1', timeout: 0.5))
             ->toThrow(RuntimeException::class);
     });
 });
 
-test('TcpClient connects to Unix socket', function () {
-    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+test('TcpClient connects to a Unix socket', function () {
+    if ('WIN' === strtoupper(substr(PHP_OS, 0, 3))) {
         $this->markTestSkipped('Unix sockets not supported on Windows');
     }
-
     $socketPath = sys_get_temp_dir() . '/phasync_client_test_' . uniqid() . '.sock';
-    if (file_exists($socketPath)) unlink($socketPath);
 
-    phasync::run(function () use ($socketPath) {
+    $response = phasync::run(function () use ($socketPath) {
         $server = new TcpServer("unix://$socketPath");
 
         phasync::go(function () use ($server) {
             foreach ($server->accept() as $stream) {
-                fwrite($stream, "Unix OK");
+                fwrite(phasync::writable($stream), 'Unix OK');
                 fclose($stream);
                 $server->close();
-                break;
             }
         });
 
-        $client = TcpClient::connectUnix($socketPath);
-        $response = fread($client, 65536);
+        $client   = TcpClient::connectUnix($socketPath);
+        $response = fread(phasync::readable($client), 65536);
         fclose($client);
 
-        expect($response)->toBe("Unix OK");
+        return $response;
     });
 
-    if (file_exists($socketPath)) unlink($socketPath);
+    expect($response)->toBe('Unix OK');
 });

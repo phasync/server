@@ -3,20 +3,21 @@
 namespace phasync\Net;
 
 use phasync;
-use phasync\Internal\AsyncStream;
 use RuntimeException;
 
 /**
  * A non-blocking TCP client for phasync.
  *
- * Handles asynchronous connection establishment without blocking the event loop.
- * Returns AsyncStream-wrapped connections for transparent async I/O.
+ * Connects without blocking the event loop, including DNS resolution. Returns a plain
+ * non-blocking stream: wait with phasync::readable() / phasync::writable() before reading
+ * or writing, or load the phasync extension (see phasync\try_enable_ext()) to make plain
+ * fread() / fwrite() suspend the coroutine by themselves.
  *
  * Example usage:
  * ```php
  * $conn = TcpClient::connect('example.com:80');
- * fwrite($conn, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
- * $response = stream_get_contents($conn);
+ * fwrite(phasync::writable($conn), "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+ * $response = fread(phasync::readable($conn), 65536);
  * fclose($conn);
  * ```
  */
@@ -28,7 +29,7 @@ final class TcpClient
      * @param string $address Address to connect to (e.g., '127.0.0.1:80', 'example.com:443')
      * @param float $timeout Connection timeout in seconds
      * @param array $context Stream context options
-     * @return resource AsyncStream-wrapped connection
+     * @return resource non-blocking connection stream
      * @throws RuntimeException If connection fails or times out
      */
     public static function connect(string $address, float $timeout = 30, array $context = []): mixed
@@ -85,11 +86,7 @@ final class TcpClient
             throw $e;
         }
 
-        stream_set_read_buffer($socket, 0);
-        stream_set_write_buffer($socket, 0);
-        stream_set_chunk_size($socket, 65536);
-
-        return AsyncStream::wrap($socket);
+        return $socket;
     }
 
     /**
@@ -98,7 +95,7 @@ final class TcpClient
      * @param string $path Socket path (e.g., '/var/run/app.sock')
      * @param float $timeout Connection timeout in seconds
      * @param array $context Stream context options
-     * @return resource AsyncStream-wrapped connection
+     * @return resource non-blocking connection stream
      * @throws RuntimeException If connection fails
      */
     public static function connectUnix(string $path, float $timeout = 30, array $context = []): mixed

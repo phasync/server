@@ -2,84 +2,92 @@
 
 use phasync\Net\UdpServer;
 
-function get_free_udp_port(): int {
-    $sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-    socket_bind($sock, '127.0.0.1', 0);
-    socket_getsockname($sock, $addr, $port);
-    socket_close($sock);
-    return $port;
-}
+test('UdpServer binds to port 0 and reports the real address', function () {
+    $server = new UdpServer('127.0.0.1:0');
+    expect($server->getAddress())->toMatch('/^127\.0\.0\.1:[1-9][0-9]*$/');
+    $server->close();
+});
 
-test('UdpServer echoes data', function () {
-    phasync::run(function () {
-        $port = get_free_udp_port();
-        $server = new UdpServer("127.0.0.1:$port");
+test('UdpServer yields peer => data and can reply with send()', function () {
+    $response = phasync::run(function () {
+        $server = new UdpServer('127.0.0.1:0');
 
-        expect($server->getAddresses())->toHaveCount(1);
-
-        // Server coroutine
         phasync::go(function () use ($server) {
-            foreach ($server->receive() as $peer => [$data, $socket]) {
-                // Reply using the correct socket
-                stream_socket_sendto($socket, "Echo: $data", 0, $peer);
+            foreach ($server->receive() as $peer => $data) {
+                $server->send($peer, "Echo: $data");
                 $server->close();
-                break;
             }
         });
 
-        // Client
-        $client = stream_socket_client("udp://127.0.0.1:$port");
-        fwrite($client, "Hello UDP");
-        phasync::readable($client);
-        $response = fread($client, 65536);
+        $client = stream_socket_client('udp://' . $server->getAddress());
+        stream_set_blocking($client, false);
+        fwrite($client, 'Hello UDP');
+        $response = fread(phasync::readable($client), 65536);
         fclose($client);
 
-        expect($response)->toBe("Echo: Hello UDP");
+        return $response;
     });
+
+    expect($response)->toBe('Echo: Hello UDP');
 });
 
-test('UdpServer handles multiple interfaces correctly', function () {
-    phasync::run(function () {
-        $port1 = get_free_udp_port();
-        $port2 = get_free_udp_port();
-        $server = new UdpServer(["127.0.0.1:$port1", "127.0.0.1:$port2"]);
+test('UdpServer takes datagrams already waiting without suspending', function () {
+    $result = phasync::run(function () {
+        $server = new UdpServer('127.0.0.1:0');
+        $client = stream_socket_client('udp://' . $server->getAddress());
+        for ($i = 0; $i < 20; ++$i) {
+            fwrite($client, "msg$i");
+        }
+        phasync::sleep(0.05);
 
-        expect($server->getAddresses())->toHaveCount(2);
-
-        $replies = 0;
-
-        // Server coroutine
-        phasync::go(function () use ($server, &$replies) {
-            foreach ($server->receive() as $peer => [$data, $socket]) {
-                stream_socket_sendto($socket, "Got: $data", 0, $peer);
-                $replies++;
-
-                if ($replies >= 2) {
-                    $server->close();
-                    break;
-                }
+        $turns   = 0;
+        $stop    = false;
+        $sibling = phasync::go(function () use (&$turns, &$stop) {
+            while (!$stop) {
+                ++$turns;
+                phasync::sleep(0);
             }
         });
 
-        // Client 1 -> Port 1
-        $c1 = stream_socket_client("udp://127.0.0.1:$port1");
-        fwrite($c1, "Payload1");
-        phasync::readable($c1);
-        expect(fread($c1, 1024))->toBe("Got: Payload1");
-        fclose($c1);
+        $before   = $turns;
+        $received = [];
+        foreach ($server->receive() as $data) {
+            $received[] = $data;
+            if (20 === count($received)) {
+                break;
+            }
+        }
+        $siblingTurns = $turns - $before;
 
-        // Client 2 -> Port 2
-        $c2 = stream_socket_client("udp://127.0.0.1:$port2");
-        fwrite($c2, "Payload2");
-        phasync::readable($c2);
-        expect(fread($c2, 1024))->toBe("Got: Payload2");
-        fclose($c2);
+        $stop = true;
+        phasync::await($sibling);
+        fclose($client);
+        $server->close();
 
-        expect($replies)->toBe(2);
+        return [count($received), $received[0], $received[19], $siblingTurns];
     });
+
+    expect($result)->toBe([20, 'msg0', 'msg19', 0]);
 });
 
-test('UdpServer throws on invalid address', function () {
-    expect(fn() => @new UdpServer('invalid:99999'))
-        ->toThrow(RuntimeException::class);
+test('closing the server ends a waiting receive() loop without an exception', function () {
+    $result = phasync::run(function () {
+        $server = new UdpServer('127.0.0.1:0');
+        $loop   = phasync::go(function () use ($server) {
+            foreach ($server->receive() as $data) {
+            }
+
+            return 'loop ended';
+        });
+        phasync::sleep(0.05);
+        $server->close();
+
+        return [phasync::await($loop), $server->isClosed()];
+    });
+
+    expect($result)->toBe(['loop ended', true]);
+});
+
+test('UdpServer throws on an address it cannot bind', function () {
+    expect(fn () => new UdpServer('invalid:99999'))->toThrow(RuntimeException::class);
 });

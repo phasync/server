@@ -2,40 +2,46 @@
 
 use phasync\Net\TcpServer;
 
-test('TcpServer supports Unix Domain Sockets', function () {
-    // Skip on Windows
-    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+beforeEach(function () {
+    if ('WIN' === strtoupper(substr(PHP_OS, 0, 3))) {
         $this->markTestSkipped('Unix sockets not supported on Windows');
     }
+});
 
+test('TcpServer supports Unix domain sockets', function () {
     $socketPath = sys_get_temp_dir() . '/phasync_test_' . uniqid() . '.sock';
-    if (file_exists($socketPath)) unlink($socketPath);
 
-    phasync::run(function () use ($socketPath) {
+    $response = phasync::run(function () use ($socketPath) {
         $server = new TcpServer("unix://$socketPath");
-        $response = null;
 
-        // Server coroutine
-        phasync::go(function() use ($server) {
+        phasync::go(function () use ($server) {
             foreach ($server->accept() as $conn) {
-                fwrite(phasync::writable($conn), "Hello Unix");
+                fwrite(phasync::writable($conn), 'Hello Unix');
                 fclose($conn);
                 $server->close();
-                break;
             }
         });
 
-        // Client - must also use non-blocking operations
-        $client = stream_socket_client("unix://$socketPath", $errno, $errstr);
-        expect($client)->toBeResource();
+        $client = stream_socket_client("unix://$socketPath");
         stream_set_blocking($client, false);
-
-        phasync::readable($client);
-        $response = fread($client, 65536);
+        $response = fread(phasync::readable($client), 65536);
         fclose($client);
 
-        expect($response)->toBe("Hello Unix");
+        return $response;
     });
 
-    if (file_exists($socketPath)) unlink($socketPath);
+    expect($response)->toBe('Hello Unix');
+});
+
+test('closing a Unix socket server removes the socket file, so the path can be bound again', function () {
+    $socketPath = sys_get_temp_dir() . '/phasync_test_' . uniqid() . '.sock';
+
+    $server = new TcpServer("unix://$socketPath");
+    expect(file_exists($socketPath))->toBeTrue();
+    $server->close();
+    expect(file_exists($socketPath))->toBeFalse();
+
+    $again = new TcpServer("unix://$socketPath");
+    $again->close();
+    expect(file_exists($socketPath))->toBeFalse();
 });

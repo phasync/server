@@ -2,190 +2,190 @@
 
 namespace phasync\Net;
 
-use phasync;
-use phasync\Internal\AsyncStream;
 use Generator;
+use phasync;
+use phasync\IOException;
 
 /**
- * A simple TCP server that accepts connections on one or more addresses.
+ * A TCP or Unix domain socket server listening on one address.
  *
- * Example usage:
+ * Modeled on Go's net.Listener: one server is one listening socket and one accept loop.
+ * To listen on several addresses, create one server per address and run each accept loop
+ * in its own coroutine. To handle all of them in one place, have each loop write its
+ * connections to a shared channel.
+ *
+ * Accepted connections are plain non-blocking stream resources. Wait with
+ * phasync::readable() / phasync::writable() before reading or writing, or load the
+ * phasync extension (see phasync\try_enable_ext()) to make plain fread() / fwrite()
+ * suspend the coroutine by themselves.
+ *
+ * Example:
  * ```php
- * $server = new TcpServer('0.0.0.0:8080');
- * foreach ($server->accept() as $addr => $stream) {
- *     phasync::go(function() use ($stream, $addr) {
- *         fwrite(phasync::writable($stream), "Hello $addr\n");
- *         fclose($stream);
- *     });
- * }
+ * phasync::run(function () {
+ *     $server = new TcpServer('0.0.0.0:8080');
+ *     foreach ($server->accept() as $peer => $stream) {
+ *         phasync::go(function () use ($stream) {
+ *             $request = fread(phasync::readable($stream), 65536);
+ *             fwrite(phasync::writable($stream), "HTTP/1.0 200 OK\r\n\r\nHello\n");
+ *             fclose($stream);
+ *         });
+ *     }
+ * });
  * ```
  */
 final class TcpServer
 {
-    /** @var resource[] */
-    private array $sockets = [];
+    /** @var resource|null */
+    private $socket;
 
-    /** @var string[] Map of socket id to bound address */
-    private array $addresses = [];
+    private string $address;
 
-    private bool $closed = false;
-    private bool $wrapStreams;
-    private int $readBuffer;
-    private int $writeBuffer;
+    /** Path of the socket file for a unix:// server, removed again on close(). */
+    private ?string $unixPath = null;
 
     /**
-     * @param string|string[] $addresses Address(es) to listen on (e.g., '0.0.0.0:8080' or ['0.0.0.0:80', '0.0.0.0:443'])
-     * @param array $context Optional stream context options
-     * @param bool $wrapStreams Wrap accepted streams with AsyncStream for transparent async I/O (default: true)
-     * @param int $readBuffer Read buffer size in bytes (0 for unbuffered)
-     * @param int $writeBuffer Write buffer size in bytes (0 for unbuffered)
+     * @param string $address Address to listen on, such as '0.0.0.0:8080', '[::]:8080' or
+     *                        'unix:///run/app.sock'. Port 0 picks a free port; see getAddress().
+     * @param array  $context Stream context options. Defaults: backlog 65535 (the kernel caps
+     *                        it at its own limit, net.core.somaxconn on Linux), and for TCP
+     *                        so_reuseport and tcp_nodelay enabled.
+     *
+     * @throws \RuntimeException if the address cannot be bound
      */
-    public function __construct(
-        string|array $addresses,
-        array $context = [],
-        bool $wrapStreams = true,
-        int $readBuffer = 0,
-        int $writeBuffer = 0
-    ) {
-        $this->wrapStreams = $wrapStreams;
-        $this->readBuffer = $readBuffer;
-        $this->writeBuffer = $writeBuffer;
-
-        if (is_string($addresses)) {
-            $addresses = [$addresses];
+    public function __construct(string $address, array $context = [])
+    {
+        if (!\str_contains($address, '://')) {
+            $address = 'tcp://' . $address;
         }
+        $protocol = \strstr($address, '://', true);
+        $context  = self::applyDefaultContext($context, $protocol);
 
-        foreach ($addresses as $address) {
-            // Add tcp:// if no protocol specified
-            if (!str_contains($address, '://')) {
-                $address = 'tcp://' . $address;
-            }
+        $warning = null;
+        \set_error_handler(static function (int $code, string $message) use (&$warning): bool {
+            $warning = $message;
 
-            // Detect protocol for context options
-            $protocol = strstr($address, '://', true);
-            $socketContext = $this->applyDefaultContext($context, $protocol);
-            $streamContext = stream_context_create($socketContext);
-
-            $socket = @stream_socket_server(
+            return true;
+        });
+        try {
+            $socket = \stream_socket_server(
                 $address,
                 $errno,
                 $errstr,
-                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
-                $streamContext
+                \STREAM_SERVER_BIND | \STREAM_SERVER_LISTEN,
+                \stream_context_create($context)
             );
+        } finally {
+            \restore_error_handler();
+        }
+        if (!$socket) {
+            throw new \RuntimeException("Failed to bind to $address: " . ($errstr ?: $warning ?? 'unknown error'), $errno);
+        }
 
-            if (!$socket) {
-                $this->close();
-                throw new \RuntimeException("Failed to bind to $address: $errstr", $errno);
-            }
-
-            stream_set_blocking($socket, false);
-            $id = (int) $socket;
-            $this->sockets[$id] = $socket;
-            $this->addresses[$id] = stream_socket_get_name($socket, false);
+        \stream_set_blocking($socket, false);
+        $this->socket  = $socket;
+        $this->address = (string) \stream_socket_get_name($socket, false);
+        if ('unix' === $protocol) {
+            $this->unixPath = \substr($address, \strlen('unix://'));
         }
     }
 
     /**
-     * Accept incoming connections.
+     * Accept connections as they arrive.
      *
-     * @return Generator<string, resource> Yields peer address => stream
+     * Every connection already waiting in the kernel's accept queue is taken without
+     * waiting for the event loop, so a burst of connections is admitted at once. The loop
+     * ends when the server is closed.
+     *
+     * @return Generator<string, resource> peer address => connection stream
      */
     public function accept(): Generator
     {
-        // Optimize for single-socket case (most common)
-        if (count($this->sockets) === 1) {
-            $socket = reset($this->sockets);
-            while (!$this->closed && is_resource($socket)) {
-                phasync::readable($socket, PHP_FLOAT_MAX);
+        while (\is_resource($this->socket)) {
+            if (!$this->hasPendingConnection()) {
+                try {
+                    phasync::readable($this->socket, \PHP_FLOAT_MAX);
+                } catch (IOException $e) {
+                    if (\is_resource($this->socket)) {
+                        throw $e;
+                    }
 
-                if ($this->closed) {
-                    break;
+                    return; // closed while waiting
                 }
-
-                $stream = @stream_socket_accept($socket, 0, $peer);
-                if ($stream) {
-                    stream_set_blocking($stream, false);
-                    stream_set_read_buffer($stream, $this->readBuffer);
-                    stream_set_write_buffer($stream, $this->writeBuffer);
-                    stream_set_chunk_size($stream, 65536);
-                    yield $peer => $this->wrapStreams ? AsyncStream::wrap($stream) : $stream;
+                if (!\is_resource($this->socket)) {
+                    return;
                 }
             }
-            return;
-        }
 
-        // Multi-socket case: use select
-        while (!$this->closed && $this->sockets) {
-            $ready = phasync::select([], read: array_values($this->sockets), timeout: PHP_FLOAT_MAX);
-
-            if ($this->closed || !$ready) {
-                break;
+            // Can still fail when several processes share this socket (so_reuseport) and
+            // another one took the connection first.
+            $stream = @\stream_socket_accept($this->socket, 0, $peer);
+            if (false === $stream) {
+                continue;
             }
+            \stream_set_blocking($stream, false);
 
-            $stream = @stream_socket_accept($ready, 0, $peer);
-            if ($stream) {
-                stream_set_blocking($stream, false);
-                stream_set_read_buffer($stream, $this->readBuffer);
-                stream_set_write_buffer($stream, $this->writeBuffer);
-                stream_set_chunk_size($stream, 65536);
-                yield $peer => $this->wrapStreams ? AsyncStream::wrap($stream) : $stream;
-            }
+            yield (string) $peer => $stream;
         }
     }
 
     /**
-     * Close all listening sockets.
+     * Stop listening. An accept() loop waiting for a connection ends. A Unix socket's file
+     * is removed.
      */
     public function close(): void
     {
-        $this->closed = true;
-        foreach ($this->sockets as $socket) {
-            if (is_resource($socket)) {
-                fclose($socket);
-            }
+        if (\is_resource($this->socket)) {
+            \fclose($this->socket);
         }
-        $this->sockets = [];
+        $this->socket = null;
+        if (null !== $this->unixPath && \file_exists($this->unixPath)) {
+            @\unlink($this->unixPath);
+        }
+        $this->unixPath = null;
     }
 
-    /**
-     * Check if the server is closed.
-     */
     public function isClosed(): bool
     {
-        return $this->closed;
+        return !\is_resource($this->socket);
     }
 
     /**
-     * Get the addresses the server is listening on.
-     *
-     * @return string[]
+     * The address the server is bound to, with the real port when it was created with
+     * port 0 (for example '127.0.0.1:43127'), or the socket path for a Unix socket.
      */
-    public function getAddresses(): array
+    public function getAddress(): string
     {
-        return array_values($this->addresses);
+        return $this->address;
     }
 
     /**
-     * Apply default context options based on protocol.
+     * Whether a connection is waiting in the accept queue right now, without blocking.
+     * Checking first avoids calling stream_socket_accept() on an empty queue, which always
+     * emits a warning. Uses the phasync extension's stream_select() when loaded, since the
+     * native one fails for file descriptor numbers at or above FD_SETSIZE.
      */
-    private function applyDefaultContext(array $context, string $protocol): array
+    private function hasPendingConnection(): bool
     {
-        if (!isset($context['socket']['backlog'])) {
-            $context['socket']['backlog'] = 511;
-        }
+        $read   = [$this->socket];
+        $write  = null;
+        $except = null;
+        $ready  = \function_exists('phasync\ext\stream_select')
+            ? \phasync\ext\stream_select($read, $write, $except, 0, 0)
+            : @\stream_select($read, $write, $except, 0, 0);
 
-        if ($protocol === 'unix') {
+        return $ready > 0;
+    }
+
+    private static function applyDefaultContext(array $context, string $protocol): array
+    {
+        $context['socket']['backlog'] ??= 65535;
+
+        if ('unix' === $protocol) {
             // Unix sockets don't support these options
-            unset($context['socket']['so_reuseport']);
-            unset($context['socket']['tcp_nodelay']);
+            unset($context['socket']['so_reuseport'], $context['socket']['tcp_nodelay']);
         } else {
-            if (!isset($context['socket']['so_reuseport'])) {
-                $context['socket']['so_reuseport'] = true;
-            }
-            if (!isset($context['socket']['tcp_nodelay'])) {
-                $context['socket']['tcp_nodelay'] = true;
-            }
+            $context['socket']['so_reuseport'] ??= true;
+            $context['socket']['tcp_nodelay']  ??= true;
         }
 
         return $context;
