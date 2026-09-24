@@ -5,7 +5,6 @@
     "license": "MIT",
     "autoload": {
         "psr-4": {
-            "phasync\\Server\\": "src/Server/",
             "phasync\\Net\\": "src/Net/"
         }
     },

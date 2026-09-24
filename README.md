@@ -268,19 +268,31 @@ lower: waiting on I/O suspends a fiber, where node allocates promises for every 
 
 The scripts are in [`benchmarking/`](benchmarking/).
 
-## Deprecated: Server class
+## Upgrading from 1.x
 
-The original `Server` class is deprecated. Migrate to `TcpServer` or `UdpServer`:
+2.0 requires phasync 2.0 and changes the API:
 
-```php
-// Old (deprecated)
-Server::serve('tcp://127.0.0.1:8080', function ($stream, $peer) {
-    // handle connection
-});
+- **`phasync\Server\Server` is removed.** Use `TcpServer` or `UdpServer`:
 
-// New
-$server = new TcpServer('127.0.0.1:8080');
-foreach ($server->accept() as $peer => $stream) {
-    phasync::go(fn () => /* handle connection */);
-}
-```
+  ```php
+  // 1.x
+  Server::serve('tcp://127.0.0.1:8080', function ($stream, $peer) {
+      // handle connection
+  });
+
+  // 2.0
+  $server = new TcpServer('127.0.0.1:8080');
+  foreach ($server->accept() as $peer => $stream) {
+      phasync::go(fn () => /* handle connection */);
+  }
+  ```
+
+- **One address per server.** `new TcpServer([...])` with several addresses is gone; see
+  [Several addresses](#several-addresses). `getAddresses(): array` is now
+  `getAddress(): string`.
+- **No AsyncStream wrapping.** `TcpServer::accept()` and `TcpClient::connect()` return plain
+  non-blocking streams. Wait with `phasync::readable()` / `phasync::writable()` before reading
+  or writing, or load the phasync extension. The `$wrapStreams`, `$readBuffer` and
+  `$writeBuffer` constructor parameters are removed.
+- **`UdpServer::receive()` yields `peer => data`** instead of `peer => [data, socket]`; reply
+  with `$server->send($peer, $data)`.
