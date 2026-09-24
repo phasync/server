@@ -155,3 +155,73 @@ test('server handles connection timeout', function () {
         expect(fn() => phasync::await($fiber))->toThrow(TimeoutException::class);
     });
 });
+
+/** A free local TCP port (bind to 0, read it back, release it). */
+function server_test_free_port(): int
+{
+    $probe = stream_socket_server('tcp://127.0.0.1:0');
+    $port  = (int) substr(strrchr(stream_socket_get_name($probe, false), ':'), 1);
+    fclose($probe);
+
+    return $port;
+}
+
+test('accept() takes connections already waiting in the queue without suspending', function () {
+    // With N connections queued, N accept() calls must not each wait for the event loop:
+    // a sibling coroutine counting its turns must not get a single one while they run.
+    $result = phasync::run(function () {
+        $port    = server_test_free_port();
+        $server  = new Server("tcp://127.0.0.1:$port");
+        $clients = [];
+        for ($i = 0; $i < 20; $i++) {
+            $clients[] = stream_socket_client("tcp://127.0.0.1:$port");
+        }
+        phasync::sleep(0.05); // let the kernel finish the handshakes into the accept queue
+
+        $turns   = 0;
+        $stop    = false;
+        $sibling = phasync::go(function () use (&$turns, &$stop) {
+            while (!$stop) {
+                ++$turns;
+                phasync::sleep(0);
+            }
+        });
+
+        $before   = $turns;
+        $accepted = [];
+        for ($i = 0; $i < 20; $i++) {
+            $accepted[] = $server->accept();
+        }
+        $siblingTurns = $turns - $before;
+
+        $stop = true;
+        phasync::await($sibling);
+        $acceptedCount = count(array_filter($accepted, 'is_resource'));
+        foreach (array_merge($clients, array_filter($accepted)) as $s) {
+            fclose($s);
+        }
+        $server->close();
+
+        return [$acceptedCount, $siblingTurns];
+    });
+
+    expect($result)->toBe([20, 0]);
+});
+
+test('accept() still waits, and times out, when nothing is queued', function () {
+    $result = phasync::run(function () {
+        $server = new Server('tcp://127.0.0.1:' . server_test_free_port(), timeout: 0.2);
+        $start  = microtime(true);
+        try {
+            $server->accept();
+
+            return 'no exception';
+        } catch (TimeoutException) {
+            return microtime(true) - $start;
+        } finally {
+            $server->close();
+        }
+    });
+
+    expect($result)->toBeGreaterThanOrEqual(0.2);
+});

@@ -4,20 +4,20 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "29751d0e1dd9803044e0174678e7ff27",
+    "content-hash": "90869089d8ebf6a4762f11fe56852e25",
     "packages": [
         {
             "name": "phasync/phasync",
-            "version": "1.1.0",
+            "version": "2.0.0-alpha0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/phasync/phasync.git",
-                "reference": "9492eb12dc0d4f78132b8321a139dadaf1bfc7e5"
+                "reference": "54c36bd6b01cbea30798d2835e9d6b720a2e7a21"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/phasync/phasync/zipball/9492eb12dc0d4f78132b8321a139dadaf1bfc7e5",
-                "reference": "9492eb12dc0d4f78132b8321a139dadaf1bfc7e5",
+                "url": "https://api.github.com/repos/phasync/phasync/zipball/54c36bd6b01cbea30798d2835e9d6b720a2e7a21",
+                "reference": "54c36bd6b01cbea30798d2835e9d6b720a2e7a21",
                 "shasum": ""
             },
             "require": {
@@ -32,6 +32,9 @@
                 "friendsofphp/php-cs-fixer": "^3.58",
                 "pestphp/pest": "^2.34 || ^3.0"
             },
+            "suggest": {
+                "phasync/phasync-ext": "Optional C extension: transparent async I/O hooks and a growable stream_select() with no FD_SETSIZE limit, CLI only. phasync works fully without it."
+            },
             "type": "library",
             "extra": {
                 "discovery": {
@@ -40,7 +43,8 @@
             },
             "autoload": {
                 "files": [
-                    "src/functions.php"
+                    "src/functions.php",
+                    "src/ext.php"
                 ],
                 "psr-4": {
                     "phasync\\": "src/"
@@ -63,9 +67,9 @@
             "description": "phasync asyncio library for PHP, providing seamless and efficient coroutines via PHP fibers",
             "support": {
                 "issues": "https://github.com/phasync/phasync/issues",
-                "source": "https://github.com/phasync/phasync/tree/1.1.0"
+                "source": "https://github.com/phasync/phasync/tree/2.0.0-alpha0"
             },
-            "time": "2026-09-22T10:29:18+00:00"
+            "time": "2026-09-24T14:29:34+00:00"
         },
         {
             "name": "psr/http-factory",
@@ -5693,7 +5697,9 @@
     ],
     "aliases": [],
     "minimum-stability": "stable",
-    "stability-flags": {},
+    "stability-flags": {
+        "phasync/phasync": 15
+    },
     "prefer-stable": false,
     "prefer-lowest": false,
     "platform": {

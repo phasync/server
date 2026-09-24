@@ -247,8 +247,17 @@ final class Server
      */
     public function accept(?string &$peer_name = null)
     {
-        \phasync::readable($this->socket, $this->timeout);
-        $result = \stream_socket_accept($this->socket, 0, $peer_name);
+        // Take a connection that is already queued without waiting for the event loop,
+        // so a caller looping over accept() drains the whole backlog in one go instead of
+        // admitting a single connection per loop iteration. Only wait when the queue is
+        // empty. Checking first avoids calling stream_socket_accept() on an empty queue,
+        // which always emits a warning.
+        if (!$this->hasPendingConnection()) {
+            \phasync::readable($this->socket, $this->timeout);
+        }
+        // Can still fail when several processes share this socket (so_reuseport) and
+        // another one took the connection first.
+        $result = @\stream_socket_accept($this->socket, 0, $peer_name);
         if (!$result) {
             return false;
         }
@@ -297,6 +306,23 @@ final class Server
         \phasync::readable($this->socket, $this->timeout);
 
         return \stream_socket_recvfrom($this->socket, $length, $flags, $address);
+    }
+
+    /**
+     * Whether a connection is waiting in the accept queue right now, without blocking.
+     * Uses the phasync extension's stream_select() when loaded, since the native one
+     * fails for file descriptor numbers at or above FD_SETSIZE (1024 on a typical build).
+     */
+    private function hasPendingConnection(): bool
+    {
+        $read   = [$this->socket];
+        $write  = null;
+        $except = null;
+        $ready  = \function_exists('phasync\ext\stream_select')
+            ? \phasync\ext\stream_select($read, $write, $except, 0, 0)
+            : @\stream_select($read, $write, $except, 0, 0);
+
+        return $ready > 0;
     }
 
     /**
