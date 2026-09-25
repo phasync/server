@@ -266,18 +266,18 @@ In the benchmark below it added 8–18% throughput.
 ## Benchmark
 
 Hello-world keep-alive HTTP responder on raw sockets (no HTTP library), one process each:
-phasync with the extension and JIT, and node v18 with the `net` module.
+phasync/net 2.0.0-alpha1 with phasync-ext 0.4.0-alpha11 and JIT on PHP 8.3, and node v18 with the `net` module.
 `wrk -t8 -d10s` on a Ryzen 9 9950X3D:
 
 | Connections | phasync req/s | node req/s | phasync p99 | node p99 |
 |---|---|---|---|---|
-| 100 | 248k | 266k | 0.51 ms | 0.48 ms |
-| 900 | 222k | 250k | 4.9 ms | 381 ms |
-| 10,000 | 105k | 154k* | 98 ms | 26 ms* |
+| 100 | 254k | 262k | 0.47 ms | 0.50 ms |
+| 900 | 230k | 252k | 5.0 ms | 376 ms |
+| 10,000 | 105k | 155k* | 98 ms | 30 ms* |
 
-\* At 10,000 connections node had only accepted about 7,500 of them after 5 seconds, with
-352 timeouts and 52 read errors, so it was serving fewer clients. phasync had all 10,000
-connections accepted with no errors.
+\* At 10,000 connections node had only accepted about 8,350 of them after 5 seconds, with
+287 timeouts, so it was serving fewer clients. phasync had all 10,000 connections accepted
+with no errors.
 
 This handler does almost nothing per request, which favours node: its event loop runs in C
 while phasync's runs in PHP. With more work per request, phasync's per-request overhead is
