@@ -1,21 +1,20 @@
 <?php
 
-use phasync\Net\TcpServer;
 use phasync\Util\WaitGroup;
 
-test('TcpServer binds to port 0 and reports the real address', function () {
-    $server = new TcpServer('127.0.0.1:0');
-    expect($server->getAddress())->toMatch('/^127\.0\.0\.1:[1-9][0-9]*$/');
+test('Listener binds to port 0 and reports the real address', function () {
+    $server = phasync\Net\listen('127.0.0.1:0');
+    expect($server->addr())->toMatch('/^127\.0\.0\.1:[1-9][0-9]*$/');
     $server->close();
 });
 
-test('TcpServer accepts a connection with foreach and yields peer => stream', function () {
+test('Listener accepts a connection with foreach and yields peer => stream', function () {
     $result = phasync::run(function () {
-        $server = new TcpServer('127.0.0.1:0');
+        $server = phasync\Net\listen('127.0.0.1:0');
         $got    = null;
 
         phasync::go(function () use ($server, &$got) {
-            foreach ($server->accept() as $peer => $stream) {
+            foreach ($server as $peer => $stream) {
                 $got  = [$peer, fread(phasync::readable($stream), 65536)];
                 fwrite(phasync::writable($stream), 'Got: ' . $got[1]);
                 fclose($stream);
@@ -23,7 +22,7 @@ test('TcpServer accepts a connection with foreach and yields peer => stream', fu
             }
         });
 
-        $client = stream_socket_client('tcp://' . $server->getAddress());
+        $client = stream_socket_client('tcp://' . $server->addr());
         stream_set_blocking($client, false);
         fwrite(phasync::writable($client), 'Hello');
         $response = fread(phasync::readable($client), 65536);
@@ -38,11 +37,11 @@ test('TcpServer accepts a connection with foreach and yields peer => stream', fu
     expect($response)->toBe('Got: Hello');
 });
 
-test('TcpServer yields plain stream resources, not AsyncStream-wrapped ones', function () {
+test('Listener yields plain stream resources, not AsyncStream-wrapped ones', function () {
     $meta = phasync::run(function () {
-        $server = new TcpServer('127.0.0.1:0');
-        $client = stream_socket_client('tcp://' . $server->getAddress());
-        foreach ($server->accept() as $stream) {
+        $server = phasync\Net\listen('127.0.0.1:0');
+        $client = stream_socket_client('tcp://' . $server->addr());
+        foreach ($server as $stream) {
             $meta = stream_get_meta_data($stream);
             fclose($stream);
             break;
@@ -57,14 +56,14 @@ test('TcpServer yields plain stream resources, not AsyncStream-wrapped ones', fu
     expect($meta['blocked'])->toBeFalse();
 });
 
-test('TcpServer takes connections already waiting in the queue without suspending', function () {
+test('Listener takes connections already waiting in the queue without suspending', function () {
     // With N connections queued, accepting all of them must not wait for the event loop
     // between connections: a sibling coroutine counting its turns must get none.
     $result = phasync::run(function () {
-        $server  = new TcpServer('127.0.0.1:0');
+        $server  = phasync\Net\listen('127.0.0.1:0');
         $clients = [];
         for ($i = 0; $i < 20; ++$i) {
-            $clients[] = stream_socket_client('tcp://' . $server->getAddress());
+            $clients[] = stream_socket_client('tcp://' . $server->addr());
         }
         phasync::sleep(0.05); // let the kernel finish the handshakes into the accept queue
 
@@ -79,7 +78,7 @@ test('TcpServer takes connections already waiting in the queue without suspendin
 
         $before   = $turns;
         $accepted = [];
-        foreach ($server->accept() as $stream) {
+        foreach ($server as $stream) {
             $accepted[] = $stream;
             if (20 === count($accepted)) {
                 break;
@@ -100,11 +99,11 @@ test('TcpServer takes connections already waiting in the queue without suspendin
     expect($result)->toBe([20, 0]);
 });
 
-test('closing the server ends a waiting accept() loop without an exception', function () {
+test('closing the listener ends a waiting foreach loop without an exception', function () {
     $result = phasync::run(function () {
-        $server = new TcpServer('127.0.0.1:0');
+        $server = phasync\Net\listen('127.0.0.1:0');
         $loop   = phasync::go(function () use ($server) {
-            foreach ($server->accept() as $stream) {
+            foreach ($server as $stream) {
                 fclose($stream);
             }
 
@@ -113,26 +112,26 @@ test('closing the server ends a waiting accept() loop without an exception', fun
         phasync::sleep(0.05); // the loop is now waiting for a connection
         $server->close();
 
-        return [phasync::await($loop), $server->isClosed()];
+        return phasync::await($loop);
     });
 
-    expect($result)->toBe(['loop ended', true]);
+    expect($result)->toBe('loop ended');
 });
 
-test('TcpServer throws on an address it cannot bind', function () {
-    expect(fn () => new TcpServer('invalid:99999'))->toThrow(RuntimeException::class);
+test('Listener throws on an address it cannot bind', function () {
+    expect(fn () => phasync\Net\listen('invalid:99999'))->toThrow(RuntimeException::class);
 });
 
-test('TcpServer handles concurrent connections', function () {
+test('Listener handles concurrent connections', function () {
     phasync::run(function () {
-        $server = new TcpServer('127.0.0.1:0');
+        $server = phasync\Net\listen('127.0.0.1:0');
         $wg     = new WaitGroup();
         $count  = 10;
 
         // Echo with a delay, to prove the connections are handled concurrently.
         phasync::go(function () use ($server, $count) {
             $handled = 0;
-            foreach ($server->accept() as $conn) {
+            foreach ($server as $conn) {
                 phasync::go(function () use ($conn) {
                     phasync::sleep(0.05);
                     fwrite(phasync::writable($conn), 'Done');
@@ -149,7 +148,7 @@ test('TcpServer handles concurrent connections', function () {
             $wg->add();
             phasync::go(function () use ($server, $wg) {
                 try {
-                    $client = stream_socket_client('tcp://' . $server->getAddress());
+                    $client = stream_socket_client('tcp://' . $server->addr());
                     stream_set_blocking($client, false);
                     expect(fread(phasync::readable($client), 1024))->toBe('Done');
                     fclose($client);
@@ -165,13 +164,13 @@ test('TcpServer handles concurrent connections', function () {
     });
 });
 
-test('TcpServer handles large payloads', function () {
+test('Listener handles large payloads', function () {
     phasync::run(function () {
-        $server = new TcpServer('127.0.0.1:0');
+        $server = phasync\Net\listen('127.0.0.1:0');
 
         // Read 1 MB, reply with its hash.
         phasync::go(function () use ($server) {
-            foreach ($server->accept() as $conn) {
+            foreach ($server as $conn) {
                 $buffer = '';
                 while (true) {
                     $chunk = fread(phasync::readable($conn), 65536);
@@ -189,7 +188,7 @@ test('TcpServer handles large payloads', function () {
             }
         });
 
-        $client = stream_socket_client('tcp://' . $server->getAddress());
+        $client = stream_socket_client('tcp://' . $server->addr());
         stream_set_blocking($client, false);
         $payload = str_repeat('X', 1024 * 1024);
         $offset  = 0;
@@ -206,4 +205,50 @@ test('TcpServer handles large payloads', function () {
 
         expect($response)->toBe(md5($payload));
     });
+});
+
+test('accept() returns one connection and its peer address at a time, like Go', function () {
+    $result = phasync::run(function () {
+        $listener = phasync\Net\listen('127.0.0.1:0');
+        $client   = stream_socket_client('tcp://' . $listener->addr());
+        [$conn, $peer] = $listener->accept();
+        fwrite($client, 'ping');
+        $data = fread(phasync::readable($conn), 10);
+        fclose($conn);
+        fclose($client);
+        $listener->close();
+
+        return [is_resource($conn) || 'resource (closed)' === get_debug_type($conn), $peer, $data];
+    });
+
+    expect($result[0])->toBeTrue();
+    expect($result[1])->toMatch('/^127\.0\.0\.1:[0-9]+$/');
+    expect($result[2])->toBe('ping');
+});
+
+test('accept() throws IOException on a closed listener, also in a coroutine already waiting in it', function () {
+    $result = phasync::run(function () {
+        $listener = phasync\Net\listen('127.0.0.1:0');
+        $waiting  = phasync::go(function () use ($listener) {
+            try {
+                $listener->accept();
+
+                return 'accepted';
+            } catch (phasync\IOException $e) {
+                return $e->getMessage();
+            }
+        });
+        phasync::sleep(0.05);
+        $listener->close();
+        $afterwards = null;
+        try {
+            $listener->accept();
+        } catch (phasync\IOException $e) {
+            $afterwards = $e->getMessage();
+        }
+
+        return [phasync::await($waiting), $afterwards];
+    });
+
+    expect($result)->toBe(['The listener is closed', 'The listener is closed']);
 });

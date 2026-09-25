@@ -3,50 +3,47 @@
 namespace phasync\Net;
 
 use Generator;
+use IteratorAggregate;
 use phasync;
 use phasync\IOException;
 
 /**
- * A TCP or Unix domain socket server listening on one address.
+ * A listening TCP or Unix domain socket, like Go's net.Listener. Create one with listen().
  *
- * Modeled on Go's net.Listener: one server is one listening socket and one accept loop.
- * To listen on several addresses, create one server per address and run each accept loop
- * in its own coroutine. To handle all of them in one place, have each loop write its
- * connections to a shared channel.
+ * One listener is one socket. To listen on several addresses, create one listener per
+ * address and run each accept loop in its own coroutine; to handle all of them in one
+ * place, have each loop write its connections to a shared channel.
  *
- * Accepted connections are plain non-blocking stream resources. Wait with
- * phasync::readable() / phasync::writable() before reading or writing.
+ * Connections are plain non-blocking stream resources: wait with phasync::readable() /
+ * phasync::writable() before reading or writing.
  *
- * Example:
  * ```php
  * phasync::run(function () {
- *     $server = new TcpServer('0.0.0.0:8080');
- *     foreach ($server->accept() as $peer => $stream) {
- *         phasync::go(function () use ($stream) {
- *             $request = fread(phasync::readable($stream), 65536);
- *             fwrite(phasync::writable($stream), "HTTP/1.0 200 OK\r\n\r\nHello\n");
- *             fclose($stream);
+ *     $listener = phasync\Net\listen('0.0.0.0:8080');
+ *     foreach ($listener as $peer => $conn) {
+ *         phasync::go(function () use ($conn) {
+ *             $request = fread(phasync::readable($conn), 65536);
+ *             fwrite(phasync::writable($conn), "HTTP/1.0 200 OK\r\n\r\nHello\n");
+ *             fclose($conn);
  *         });
  *     }
  * });
  * ```
+ *
+ * @implements IteratorAggregate<string, resource>
  */
-final class TcpServer
+final class Listener implements IteratorAggregate
 {
     /** @var resource|null */
     private $socket;
 
     private string $address;
 
-    /** Path of the socket file for a unix:// server, removed again on close(). */
+    /** Path of the socket file for a unix:// listener, removed again on close(). */
     private ?string $unixPath = null;
 
     /**
-     * @param string $address Address to listen on, such as '0.0.0.0:8080', '[::]:8080' or
-     *                        'unix:///run/app.sock'. Port 0 picks a free port; see getAddress().
-     * @param array  $context Stream context options. Defaults: backlog 65535 (the kernel caps
-     *                        it at its own limit, net.core.somaxconn on Linux), and for TCP
-     *                        so_reuseport and tcp_nodelay enabled.
+     * @see listen()
      *
      * @throws \RuntimeException if the address cannot be bound
      */
@@ -88,15 +85,15 @@ final class TcpServer
     }
 
     /**
-     * Accept connections as they arrive.
+     * Wait for the next connection and return it, like Go's Listener.Accept(). A connection
+     * already waiting in the kernel's queue is returned without waiting for the event loop,
+     * so a burst of connections is admitted at once.
      *
-     * Every connection already waiting in the kernel's accept queue is taken without
-     * waiting for the event loop, so a burst of connections is admitted at once. The loop
-     * ends when the server is closed.
+     * @return array{0: resource, 1: string} the connection stream and the peer address
      *
-     * @return Generator<string, resource> peer address => connection stream
+     * @throws IOException when the listener is closed, also while waiting
      */
-    public function accept(): Generator
+    public function accept(): array
     {
         while (\is_resource($this->socket)) {
             if (!$this->hasPendingConnection()) {
@@ -106,11 +103,10 @@ final class TcpServer
                     if (\is_resource($this->socket)) {
                         throw $e;
                     }
-
-                    return; // closed while waiting
+                    break; // closed while waiting
                 }
                 if (!\is_resource($this->socket)) {
-                    return;
+                    break;
                 }
             }
 
@@ -122,13 +118,37 @@ final class TcpServer
             }
             \stream_set_blocking($stream, false);
 
-            yield (string) $peer => $stream;
+            return [$stream, (string) $peer];
+        }
+
+        throw new IOException('The listener is closed');
+    }
+
+    /**
+     * Accept connections in a foreach loop: peer address => connection stream. The loop ends
+     * when the listener is closed.
+     *
+     * @return Generator<string, resource>
+     */
+    public function getIterator(): Generator
+    {
+        while (\is_resource($this->socket)) {
+            try {
+                [$stream, $peer] = $this->accept();
+            } catch (IOException $e) {
+                if (\is_resource($this->socket)) {
+                    throw $e;
+                }
+
+                return;
+            }
+            yield $peer => $stream;
         }
     }
 
     /**
-     * Stop listening. An accept() loop waiting for a connection ends. A Unix socket's file
-     * is removed.
+     * Stop listening. A coroutine waiting in accept() gets IOException, and a foreach loop
+     * over the listener ends. A Unix socket's file is removed.
      */
     public function close(): void
     {
@@ -142,16 +162,11 @@ final class TcpServer
         $this->unixPath = null;
     }
 
-    public function isClosed(): bool
-    {
-        return !\is_resource($this->socket);
-    }
-
     /**
-     * The address the server is bound to, with the real port when it was created with
-     * port 0 (for example '127.0.0.1:43127'), or the socket path for a Unix socket.
+     * The address the listener is bound to, with the real port when it listened on port 0
+     * (for example '127.0.0.1:43127'), or the socket path for a Unix socket.
      */
-    public function getAddress(): string
+    public function addr(): string
     {
         return $this->address;
     }

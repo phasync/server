@@ -13,7 +13,7 @@ use function phasync\file_get_contents;
  * Example:
  * ```php
  * $ip = Dns::resolve('example.com');
- * $conn = TcpClient::connect("$ip:80");
+ * $conn = phasync\Net\dial("$ip:80");
  * ```
  */
 final class Dns

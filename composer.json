@@ -6,7 +6,10 @@
     "autoload": {
         "psr-4": {
             "phasync\\Net\\": "src/Net/"
-        }
+        },
+        "files": [
+            "src/Net/functions.php"
+        ]
     },
     "authors": [
         {

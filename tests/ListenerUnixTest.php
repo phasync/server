@@ -1,21 +1,19 @@
 <?php
 
-use phasync\Net\TcpServer;
-
 beforeEach(function () {
     if ('WIN' === strtoupper(substr(PHP_OS, 0, 3))) {
         $this->markTestSkipped('Unix sockets not supported on Windows');
     }
 });
 
-test('TcpServer supports Unix domain sockets', function () {
+test('Listener supports Unix domain sockets', function () {
     $socketPath = sys_get_temp_dir() . '/phasync_test_' . uniqid() . '.sock';
 
     $response = phasync::run(function () use ($socketPath) {
-        $server = new TcpServer("unix://$socketPath");
+        $server = phasync\Net\listen("unix://$socketPath");
 
         phasync::go(function () use ($server) {
-            foreach ($server->accept() as $conn) {
+            foreach ($server as $conn) {
                 fwrite(phasync::writable($conn), 'Hello Unix');
                 fclose($conn);
                 $server->close();
@@ -36,12 +34,12 @@ test('TcpServer supports Unix domain sockets', function () {
 test('closing a Unix socket server removes the socket file, so the path can be bound again', function () {
     $socketPath = sys_get_temp_dir() . '/phasync_test_' . uniqid() . '.sock';
 
-    $server = new TcpServer("unix://$socketPath");
+    $server = phasync\Net\listen("unix://$socketPath");
     expect(file_exists($socketPath))->toBeTrue();
     $server->close();
     expect(file_exists($socketPath))->toBeFalse();
 
-    $again = new TcpServer("unix://$socketPath");
+    $again = phasync\Net\listen("unix://$socketPath");
     $again->close();
     expect(file_exists($socketPath))->toBeFalse();
 });
