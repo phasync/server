@@ -60,14 +60,15 @@ test('Dns caches results', function () {
         Dns::clearCache();
 
         $start = microtime(true);
-        $ip1 = Dns::resolve('google.com', DnsRecordType::A, 5.0);
+        $all = Dns::resolveAll('google.com', DnsRecordType::A, 5.0);
         $first = microtime(true) - $start;
 
         $start = microtime(true);
-        $ip2 = Dns::resolve('google.com', DnsRecordType::A, 5.0);
+        $ip = Dns::resolve('google.com', DnsRecordType::A, 5.0);
         $second = microtime(true) - $start;
 
-        expect($ip1)->toBe($ip2);
+        // resolve() picks one of several records at random, so check it came from the cache
+        expect($all)->toContain($ip);
         expect($second)->toBeLessThan($first); // Cache should be faster
         expect($second)->toBeLessThan(0.001); // Should be nearly instant
     });
