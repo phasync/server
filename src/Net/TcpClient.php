@@ -10,8 +10,7 @@ use RuntimeException;
  *
  * Connects without blocking the event loop, including DNS resolution. Returns a plain
  * non-blocking stream: wait with phasync::readable() / phasync::writable() before reading
- * or writing, or load the phasync extension (see phasync\try_enable_ext()) to make plain
- * fread() / fwrite() suspend the coroutine by themselves.
+ * or writing.
  *
  * Example usage:
  * ```php

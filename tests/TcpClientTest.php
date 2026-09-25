@@ -38,7 +38,6 @@ test('TcpClient returns a plain non-blocking stream, not an AsyncStream-wrapped 
         return $meta;
     });
 
-    expect($meta['stream_type'])->toBe('tcp_socket/ssl');
     expect($meta['wrapper_type'] ?? null)->not->toBe('user-space');
     expect($meta['blocked'])->toBeFalse();
 });

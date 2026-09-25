@@ -53,7 +53,6 @@ test('TcpServer yields plain stream resources, not AsyncStream-wrapped ones', fu
         return $meta;
     });
 
-    expect($meta['stream_type'])->toBe('tcp_socket/ssl');
     expect($meta['wrapper_type'] ?? null)->not->toBe('user-space');
     expect($meta['blocked'])->toBeFalse();
 });

@@ -43,8 +43,8 @@ phasync::run(function () {
 
 Accepted connections are plain non-blocking stream resources. Call `phasync::readable()` /
 `phasync::writable()` before reading or writing, so the coroutine waits instead of getting
-an empty read. With the phasync extension loaded, plain `fread()` / `fwrite()` wait by
-themselves.
+an empty read. This is also the fastest pattern for a server, with or without
+[the phasync extension](#the-phasync-extension).
 
 `accept()` takes every connection already waiting in the kernel's queue before waiting
 again, so a burst of new connections is admitted at once. The loop ends when the server is
@@ -225,8 +225,13 @@ $server = new TcpServer('0.0.0.0:8080', [
 phasync waits for sockets with `stream_select()`, which in PHP fails for any file descriptor
 numbered 1024 or higher. A server with more than roughly 1,000 open connections hits that.
 The [phasync extension](https://github.com/phasync/phasync-ext) replaces it with a version
-without that limit, and also makes plain `fread()` / `fwrite()` suspend the coroutine. It is
-CLI only.
+without that limit. It is CLI only.
+
+Code written for phasync, like the examples here, works the same with the extension. Its
+other job is making ordinary blocking code cooperate: inside `phasync::run()`, a library's
+`fread()` / `fwrite()` on a blocking stream, file reads, DNS lookups and `usleep()` suspend
+the coroutine instead of stalling every connection. I/O outside PHP's streams, such as curl
+or a database client library, still blocks.
 
 ```bash
 composer require phasync/phasync-ext
@@ -292,7 +297,7 @@ The scripts are in [`benchmarking/`](benchmarking/).
   `getAddress(): string`.
 - **No AsyncStream wrapping.** `TcpServer::accept()` and `TcpClient::connect()` return plain
   non-blocking streams. Wait with `phasync::readable()` / `phasync::writable()` before reading
-  or writing, or load the phasync extension. The `$wrapStreams`, `$readBuffer` and
+  or writing. The `$wrapStreams`, `$readBuffer` and
   `$writeBuffer` constructor parameters are removed.
 - **`UdpServer::receive()` yields `peer => data`** instead of `peer => [data, socket]`; reply
   with `$server->send($peer, $data)`.

@@ -15,9 +15,7 @@ use phasync\IOException;
  * connections to a shared channel.
  *
  * Accepted connections are plain non-blocking stream resources. Wait with
- * phasync::readable() / phasync::writable() before reading or writing, or load the
- * phasync extension (see phasync\try_enable_ext()) to make plain fread() / fwrite()
- * suspend the coroutine by themselves.
+ * phasync::readable() / phasync::writable() before reading or writing.
  *
  * Example:
  * ```php
