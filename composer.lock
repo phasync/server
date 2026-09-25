@@ -8,16 +8,16 @@
     "packages": [
         {
             "name": "phasync/phasync",
-            "version": "2.0.0-alpha0",
+            "version": "2.0.0-alpha1",
             "source": {
                 "type": "git",
                 "url": "https://github.com/phasync/phasync.git",
-                "reference": "54c36bd6b01cbea30798d2835e9d6b720a2e7a21"
+                "reference": "bcf263c173e03503918f56ff2de9eb5c915ae8a5"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/phasync/phasync/zipball/54c36bd6b01cbea30798d2835e9d6b720a2e7a21",
-                "reference": "54c36bd6b01cbea30798d2835e9d6b720a2e7a21",
+                "url": "https://api.github.com/repos/phasync/phasync/zipball/bcf263c173e03503918f56ff2de9eb5c915ae8a5",
+                "reference": "bcf263c173e03503918f56ff2de9eb5c915ae8a5",
                 "shasum": ""
             },
             "require": {
@@ -67,9 +67,9 @@
             "description": "phasync asyncio library for PHP, providing seamless and efficient coroutines via PHP fibers",
             "support": {
                 "issues": "https://github.com/phasync/phasync/issues",
-                "source": "https://github.com/phasync/phasync/tree/2.0.0-alpha0"
+                "source": "https://github.com/phasync/phasync/tree/2.0.0-alpha1"
             },
-            "time": "2026-09-24T14:29:34+00:00"
+            "time": "2026-09-25T11:45:20+00:00"
         },
         {
             "name": "psr/http-factory",
