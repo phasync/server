@@ -1,6 +1,6 @@
 {
-    "name": "phasync/server",
-    "description": "A high performance async TCP and UDP socket server for PHP.",
+    "name": "phasync/net",
+    "description": "TCP, UDP and Unix socket networking for PHP using phasync coroutines.",
     "type": "library",
     "license": "MIT",
     "autoload": {

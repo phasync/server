@@ -1,6 +1,6 @@
-# phasync/server
+# phasync/net
 
-> **Note:** This package will be renamed to `phasync/net` in a future release.
+> Formerly `phasync/server`, which stays available for 1.x.
 
 TCP, UDP and Unix socket networking for PHP using phasync coroutines.
 
@@ -10,7 +10,7 @@ connections from a plain loop, and you start one coroutine per connection.
 ## Installation
 
 ```bash
-composer require phasync/server
+composer require phasync/net
 ```
 
 For production, also see [the phasync extension](#the-phasync-extension) and
@@ -274,6 +274,13 @@ lower: waiting on I/O suspends a fiber, where node allocates promises for every 
 The scripts are in [`benchmarking/`](benchmarking/).
 
 ## Upgrading from 1.x
+
+The package is renamed from `phasync/server` to `phasync/net`:
+
+```bash
+composer remove phasync/server
+composer require phasync/net
+```
 
 2.0 requires phasync 2.0 and changes the API:
 
